@@ -1,0 +1,3 @@
+[Proxy]
+# aTrust bridge (Colima): loopback SOCKS only — see atrust-surge-bridge
+HITSZ-aTrust = socks5, 127.0.0.1, 1080

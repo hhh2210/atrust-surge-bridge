@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -eq 0 ]; then
+  exit 0
+fi
+
+url="$1"
+shift
+case "${url}" in
+  *'lang=&'*) url="$(printf '%s' "${url}" | sed 's/lang=&/lang=en-US\&/')" ;;
+esac
+set -- "${url}" "$@"
+
+export DISPLAY="${DISPLAY:-:1}"
+nohup /usr/bin/chromium \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  "$@" \
+  >/tmp/atrust-browser-open.log 2>&1 &

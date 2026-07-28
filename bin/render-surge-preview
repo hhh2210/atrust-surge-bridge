@@ -1,0 +1,70 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)/lib/common.sh"
+
+SURGE_CLI="${SURGE_CLI:-/Applications/Surge.app/Contents/Applications/surge-cli}"
+OUTPUT_DIR="${SURGE_OUTPUT_DIR:-${HOME}/scratch-data/atrust-surge-bridge}"
+OUTPUT="${OUTPUT_DIR}/Ash_origin.atrust-preview.conf"
+DCONF_SRC="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)/surge/HITSZ-aTrust.dconf"
+DCONF_OUT="${OUTPUT_DIR}/HITSZ-aTrust.dconf"
+
+[[ -f "${SURGE_SOURCE}" ]] || die "Surge source profile not found: ${SURGE_SOURCE}"
+[[ -x "${SURGE_CLI}" ]] || die "surge-cli not found"
+[[ -f "${DCONF_SRC}" ]] || die "missing ${DCONF_SRC}"
+
+if rg -n 'HITSZ-aTrust' "${SURGE_SOURCE}" >/dev/null 2>&1; then
+  die "HITSZ-aTrust already exists in the source profile"
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+cp "${DCONF_SRC}" "${DCONF_OUT}"
+
+# [Proxy] already uses #!include — append detached dconf; never mix inline proxy lines.
+awk '
+  BEGIN { proxy_fixed=0; group_fixed=0; rules_fixed=0 }
+  /^#!include / && !proxy_fixed {
+    line=$0
+    sub(/[[:space:]]+$/, "", line)
+    if (line !~ /HITSZ-aTrust\.dconf/) {
+      print line ", HITSZ-aTrust.dconf"
+    } else {
+      print line
+    }
+    proxy_fixed=1
+    next
+  }
+  $0 == "[Proxy Group]" {
+    print
+    print "HITSZ = fallback, DIRECT, HITSZ-aTrust, url=https://jw.hitsz.edu.cn/, interval=60, timeout=3, evaluate-before-use=true"
+    group_fixed=1
+    next
+  }
+  $0 == "DOMAIN-SUFFIX,hitsz.edu.cn,DIRECT" {
+    print "DOMAIN,jw.hitsz.edu.cn,HITSZ"
+    print "IP-CIDR,10.248.16.0/20,HITSZ,no-resolve"
+    rules_fixed=1
+  }
+  { print }
+  END {
+    if (!proxy_fixed || !group_fixed || !rules_fixed) exit 42
+  }
+' "${SURGE_SOURCE}" >"${OUTPUT}" || die "could not locate the expected insertion points"
+
+# Resolve every relative include against the preview dir. Remote URLs and the
+# newly copied HITSZ profile need no link.
+SURGE_DIR="$(dirname -- "${SURGE_SOURCE}")"
+include_line="$(awk '/^#!include / {sub(/^#!include[[:space:]]+/, ""); print; exit}' "${SURGE_SOURCE}")"
+while IFS= read -r include; do
+  include="$(printf '%s' "${include}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [[ -n "${include}" ]] || continue
+  [[ "${include}" == http://* || "${include}" == https://* ]] && continue
+  [[ "${include}" == "HITSZ-aTrust.dconf" ]] && continue
+  [[ -e "${SURGE_DIR}/${include}" ]] || die "missing relative include: ${include}"
+  mkdir -p "$(dirname -- "${OUTPUT_DIR}/${include}")"
+  ln -sfn "${SURGE_DIR}/${include}" "${OUTPUT_DIR}/${include}"
+done < <(printf '%s\n' "${include_line}" | tr ',' '\n')
+
+"${SURGE_CLI}" --check "${OUTPUT}"
+printf '\nValidated preview only; the live/source Surge profile was not changed:\n%s\n\n' "${OUTPUT}"
+diff -u "${SURGE_SOURCE}" "${OUTPUT}" || true

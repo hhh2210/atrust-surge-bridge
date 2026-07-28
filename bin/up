@@ -1,0 +1,34 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)/lib/common.sh"
+
+open_vnc=1
+[[ "${1:-}" != "--no-open" ]] || open_vnc=0
+
+ensure_tools
+ensure_host_isolated
+ensure_env
+
+if ! colima_running; then
+  printf 'Starting isolated Colima VM (1 CPU, 1 GiB RAM)...\n'
+  start_colima
+fi
+
+wait_for_docker
+printf 'Building/starting the pinned arm64 aTrust container...\n'
+build_atrust_image
+compose up --detach --no-build --remove-orphans
+wait_for_port 5901
+
+printf '\naTrust is isolated inside Colima.\n'
+printf 'VNC:      vnc://127.0.0.1:5901\n'
+printf 'noVNC:    http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale\n'
+printf 'Password: %s\n' "$(vnc_password)"
+printf 'SOCKS5:   127.0.0.1:1080\n'
+printf 'HTTP:     127.0.0.1:8888\n'
+printf '\nUse Chromium inside the VNC desktop for web login; do not copy the login URL to the host browser.\n'
+
+if [[ "${open_vnc}" -eq 1 ]]; then
+  open 'http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale'
+fi

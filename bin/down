@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)/lib/common.sh"
+
+ensure_tools
+
+if colima_running; then
+  ensure_env
+  if docker_ctx info >/dev/null 2>&1; then
+    compose down --remove-orphans --timeout 25
+  fi
+  colima stop "${PROFILE}"
+fi
+
+for port in 1080 8888 5901 6080; do
+  if nc -z -w 1 127.0.0.1 "${port}" >/dev/null 2>&1; then
+    printf 'WARNING: 127.0.0.1:%s is still occupied by another process.\n' "${port}" >&2
+  fi
+done
+
+printf 'aTrust container and Colima VM are stopped; the persistent login volume was kept.\n'

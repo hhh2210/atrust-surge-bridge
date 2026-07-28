@@ -1,0 +1,56 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_PATH="$(realpath "$0")"
+ROOT_DIR="$(unset CDPATH; cd -- "$(dirname -- "${SCRIPT_PATH}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "${ROOT_DIR}/lib/common.sh"
+# shellcheck source=../lib/surge_mode.sh
+source "${ROOT_DIR}/lib/surge_mode.sh"
+# shellcheck source=../lib/ui.sh
+source "${ROOT_DIR}/lib/ui.sh"
+
+action="${1:-}"
+if [[ -z "${action}" ]]; then
+  if hitsz_ui_enabled; then
+    action="$(hitsz_ui_choose_action)" || exit 0
+  else
+    action="status"
+  fi
+fi
+
+case "${action}" in
+  __core_up)
+    hitsz_mode_up
+    ;;
+  __core_down)
+    hitsz_mode_down
+    ;;
+  up | on | outside | external)
+    if hitsz_ui_enabled; then
+      hitsz_ui_run_action '正在启动并验证隔离 aTrust…' "${SCRIPT_PATH}" __core_up
+      hitsz_mode_status
+    else
+      hitsz_mode_up
+      hitsz_mode_status
+    fi
+    ;;
+  down | off | inside | direct)
+    if hitsz_ui_enabled; then
+      hitsz_ui_run_action '正在关闭 Docker / Colima…' "${SCRIPT_PATH}" __core_down
+      hitsz_mode_status
+    else
+      hitsz_mode_down
+      hitsz_mode_status
+    fi
+    ;;
+  status)
+    hitsz_mode_status
+    ;;
+  *)
+    printf 'usage: hitsz {up|down|status}\n' >&2
+    printf '  up:   start isolated aTrust for use outside campus\n' >&2
+    printf '  down: stop Docker/Colima; Surge keeps campus DIRECT access\n' >&2
+    exit 64
+    ;;
+esac

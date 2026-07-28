@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-and-compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Check shell syntax
+        run: |
+          bash -n ./bin/* ./lib/*.sh ./container/* ./*.command
+          shellcheck -x -P SCRIPTDIR ./bin/* ./lib/*.sh ./container/* ./*.command
+
+      - name: Validate Compose
+        run: docker compose --env-file .env.example config --quiet
+
+      - name: Reject machine-specific paths
+        run: |
+          pattern='/''Users/[^/]+|larry''-new'
+          if grep -R -n -E "$pattern" --exclude-dir=.git .; then
+            exit 1
+          fi

@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT_DIR="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
+# shellcheck source=../lib/ssh_transport.sh
+source "${ROOT_DIR}/lib/ssh_transport.sh"
+
+ssh_transport_main "$@"

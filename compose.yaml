@@ -1,0 +1,49 @@
+name: atrust-surge-bridge
+
+services:
+  atrust:
+    image: atrust-surge:2.5.16.20-chromium-arm64
+    build:
+      context: .
+      args:
+        ATRUST_BASE: hagb/docker-atrust@sha256:60a9114dc31a10b9a809ceb283697748fe325143c78689fc9300522f89af6875
+    platform: linux/arm64
+    container_name: atrust-surge
+    hostname: atrust
+    # aTrust FakeDNS returns 198.18/16 for this internal site, but Dante cannot
+    # replay aTrust's virtual-name mapping. Resolve the verified real VPN IP.
+    extra_hosts:
+      - "${HITSZ_JW_HOST:-jw.hitsz.edu.cn}:${HITSZ_JW_IP:-10.248.17.16}"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.conf.default.route_localnet: "1"
+    environment:
+      PASSWORD: ${ATRUST_VNC_PASSWORD:?ATRUST_VNC_PASSWORD is missing}
+      USE_NOVNC: "1"
+      URLWIN: "1"
+      VNC_SIZE: 1280x800
+    volumes:
+      - atrust-data:/root
+      - atrust-system-data:/usr/share/sangfor/.aTrust
+    ports:
+      - 127.0.0.1:1080:1080
+      - 127.0.0.1:8888:8888
+      - 127.0.0.1:5901:5901
+      - 127.0.0.1:6080:8080
+    shm_size: 256m
+    restart: "no"
+    stop_grace_period: 25s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "2"
+
+volumes:
+  atrust-data:
+    name: atrust-surge-data
+  atrust-system-data:
+    name: atrust-surge-system-data

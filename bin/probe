@@ -1,0 +1,29 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)/lib/common.sh"
+
+ensure_tools
+require_command curl
+colima_running || die "aTrust VM is off"
+wait_for_docker
+container_running || die "aTrust container is not running"
+
+printf 'GPU SSH 10.249.44.191:22 via SOCKS5... '
+if nc -x 127.0.0.1:1080 -X 5 -z -w 8 10.249.44.191 22; then
+  printf 'PASS\n'
+else
+  printf 'FAIL\n' >&2
+  exit 1
+fi
+
+printf 'jw.hitsz.edu.cn via remote SOCKS5 DNS... '
+code="$(curl --socks5-hostname 127.0.0.1:1080 \
+  --connect-timeout 5 --max-time 15 --insecure --silent --show-error \
+  --output /dev/null --write-out '%{http_code}' https://jw.hitsz.edu.cn/)"
+if [[ "${code}" != "000" ]]; then
+  printf 'PASS (HTTP %s)\n' "${code}"
+else
+  printf 'FAIL\n' >&2
+  exit 1
+fi

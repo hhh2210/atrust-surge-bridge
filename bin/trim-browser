@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)/lib/common.sh"
+
+ensure_tools
+colima_running || die "aTrust VM is off"
+wait_for_docker
+container_running || die "aTrust container is not running"
+
+docker_ctx exec "${CONTAINER_NAME}" sh -c "pkill -TERM -f '[c]hromium' 2>/dev/null || true"
+printf 'In-container Chromium stopped; aTrust and the local proxies remain running.\n'

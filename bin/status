@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)/lib/common.sh"
+
+ensure_tools
+
+if ! colima_running; then
+  printf 'OFF: Colima profile %s is stopped (0 VM CPU/RAM).\n' "${PROFILE}"
+  exit 0
+fi
+
+printf 'ON: Colima profile %s is running.\n' "${PROFILE}"
+wait_for_docker
+
+if ! container_running; then
+  printf 'Container %s is not running.\n' "${CONTAINER_NAME}"
+  exit 1
+fi
+
+docker_ctx ps --filter "name=^/${CONTAINER_NAME}$" --format 'Container: {{.Status}}'
+docker_ctx stats --no-stream --format 'Usage: CPU {{.CPUPerc}}, RAM {{.MemUsage}}' "${CONTAINER_NAME}"
+
+for port in 1080 8888 5901 6080; do
+  if nc -z -w 1 127.0.0.1 "${port}" >/dev/null 2>&1; then
+    printf '127.0.0.1:%s: listening\n' "${port}"
+  else
+    printf '127.0.0.1:%s: closed\n' "${port}"
+  fi
+done
+
+if docker_ctx exec "${CONTAINER_NAME}" sh -c 'ip -4 route get 10.249.44.191 2>/dev/null | grep -q "dev utun7"'; then
+  printf 'VPN: GPU route is using the isolated utun7.\n'
+  docker_ctx exec "${CONTAINER_NAME}" sh -c 'ip -4 -brief addr show dev utun7'
+else
+  printf 'VPN: not logged in yet (utun7 only has its bootstrap address).\n'
+fi
