@@ -14,6 +14,8 @@ services:
     # replay aTrust's virtual-name mapping. Resolve the verified real VPN IP.
     extra_hosts:
       - "${HITSZ_JW_HOST:-jw.hitsz.edu.cn}:${HITSZ_JW_IP:-10.248.17.16}"
+      # Keep the aTrust control endpoint out of its own FakeIP tunnel.
+      - "${ATRUST_GATEWAY_HOST:-trust.hitsz.edu.cn}:${ATRUST_GATEWAY_IP:-219.223.250.11}"
     cap_add:
       - NET_ADMIN
     devices:

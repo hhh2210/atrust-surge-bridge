@@ -63,6 +63,23 @@ hitsz_retest_group() {
   "${SURGE_CLI}" test-group "${HITSZ_GROUP}"
 }
 
+hitsz_current_policy_override() {
+  "${SURGE_CLI}" --raw environment 2>/dev/null | jq -r --arg group "${HITSZ_GROUP}" \
+    '.environment.AutoPolicyGroupOverride[$group] // empty'
+}
+
+hitsz_set_atrust_policy_override() {
+  "${SURGE_CLI}" --raw set \
+    "AutoPolicyGroupOverride.${HITSZ_GROUP}=HITSZ-aTrust" >/dev/null
+  [[ "$(hitsz_current_policy_override)" == "HITSZ-aTrust" ]]
+}
+
+hitsz_clear_policy_override() {
+  "${SURGE_CLI}" --raw set \
+    "AutoPolicyGroupOverride.${HITSZ_GROUP}=<nil>" >/dev/null
+  [[ -z "$(hitsz_current_policy_override)" ]]
+}
+
 hitsz_normal_jw_probe() {
   local code
   code="$(hitsz_normal_jw_code 12)" || return 1
@@ -102,8 +119,10 @@ hitsz_status_jw_code() {
 }
 
 hitsz_collect_status() {
+  local override
   HITSZ_STATUS_JW_CODE="$(hitsz_status_jw_code)"
-  HITSZ_STATUS_POLICY="$(hitsz_recent_jw_policy 2>/dev/null || printf 'UNKNOWN')"
+  override="$(hitsz_current_policy_override 2>/dev/null || true)"
+  HITSZ_STATUS_POLICY="${override:-$(hitsz_recent_jw_policy 2>/dev/null || printf 'UNKNOWN')}"
 
   HITSZ_STATUS_DOCKER="OFF"
   HITSZ_STATUS_USAGE=""
@@ -142,9 +161,13 @@ hitsz_mode_start() {
 hitsz_mode_finish() {
   hitsz_vpn_ready || hitsz_wait_until_ready 0
   hitsz_repair_dante_dns
-  hitsz_retest_group
-  hitsz_normal_jw_probe
-  printf 'HITSZ outside mode is ready; Surge fallback may use aTrust.\n'
+  hitsz_set_atrust_policy_override
+  if ! hitsz_normal_jw_probe; then
+    hitsz_clear_policy_override || true
+    printf 'aTrust SOCKS is ready, but the Surge HITSZ route still failed.\n' >&2
+    return 1
+  fi
+  printf 'HITSZ outside mode is ready; Surge is pinned to aTrust until hitsz down.\n'
 }
 
 hitsz_open_login() {
@@ -156,6 +179,7 @@ hitsz_open_login() {
 }
 
 hitsz_mode_down() {
+  hitsz_clear_policy_override || true
   "${ROOT_DIR}/bin/down"
   hitsz_retest_group || true
   if hitsz_normal_jw_probe; then

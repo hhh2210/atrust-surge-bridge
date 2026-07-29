@@ -23,7 +23,7 @@ wait_for_port 5901
 
 printf '\naTrust is isolated inside Colima.\n'
 printf 'VNC:      vnc://127.0.0.1:5901\n'
-printf 'noVNC:    http://127.0.0.1:6080/vnc.html (credential auto-filled by hitsz)\n'
+printf 'noVNC:    http://127.0.0.1:6080/atrust-vnc.html (credential auto-filled by hitsz)\n'
 printf 'Password: %s\n' "$(vnc_password)"
 printf 'SOCKS5:   127.0.0.1:1080\n'
 printf 'HTTP:     127.0.0.1:8888\n'

@@ -113,10 +113,18 @@ The TUI uses a compact color card in an interactive terminal. Set
 8 GiB sparse disk. If interactive login is required, the spinner stops first,
 shows a fallback credential card, and opens noVNC with the local VNC credential
 already filled. The secret travels only in a URL fragment (which browsers do
-not send to the HTTP server), and the bundled noVNC page removes that fragment
-as soon as it caches the credential. After login, the command repairs the known
-Dante/FakeDNS cache mismatch and retests the Surge group. `hitsz down` removes
-the container and stops the VM while preserving all three login-state volumes.
+not send to the HTTP server). A cache-resistant entry page removes it before
+loading noVNC and receives a non-secret nonce on every open, so an older cached
+noVNC module cannot leave the password in the address bar. After login, the
+command repairs the known Dante/FakeDNS cache mismatch and activates the Surge
+route. `hitsz down` removes the container and stops the VM while preserving all
+three login-state volumes.
+
+After the isolated tunnel passes a real JW request, `hitsz up` applies a Surge
+runtime override that pins `HITSZ` to `HITSZ-aTrust`. This avoids false-positive
+`DIRECT` latency tests outside campus. `hitsz down` clears that override before
+stopping Docker, so the static fallback group can select campus `DIRECT` again.
+Neither command edits or reloads the Surge profile.
 
 ## Surge policy
 
@@ -145,6 +153,12 @@ IP-CIDR,10.248.16.0/20,HITSZ,no-resolve
 These HITSZ-specific addresses were verified in July 2026. Reconfirm them
 before adapting the project to another institution or VPN deployment.
 
+The container also pins the verified aTrust control endpoint
+`trust.hitsz.edu.cn` to `219.223.250.11`. Without that mapping, aTrust may send
+its own gateway through an unmapped `198.18/16` FakeIP after login while the
+data tunnel remains deceptively usable. Override `ATRUST_GATEWAY_IP` if the
+school changes the gateway address.
+
 ## Adaptive SSH
 
 `bin/ssh-connect` is an optional `ProxyCommand`. It requires a real direct SSH
@@ -164,7 +178,7 @@ timeout is two seconds and can be changed with `HITSZ_DIRECT_PROBE_TIMEOUT`.
 The login UI is available only on loopback:
 
 ```text
-http://127.0.0.1:6080/vnc.html
+http://127.0.0.1:6080/atrust-vnc.html
 ```
 
 The named volumes preserve `/root`, `/home/sangfor`, and

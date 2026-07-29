@@ -89,12 +89,13 @@ vnc_password() {
 }
 
 novnc_autologin_url() {
-  local encoded
+  local encoded nonce
   require_command jq
   ensure_env
   encoded="$(jq -rn --arg value "$(vnc_password)" '$value | @uri')"
-  printf 'http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale#password=%s\n' \
-    "${encoded}"
+  nonce="$(uuidgen | tr -d '-')"
+  printf 'http://127.0.0.1:6080/atrust-vnc.html?autoconnect=true&resize=scale&bridge_nonce=%s#password=%s\n' \
+    "${nonce}" "${encoded}"
 }
 
 colima_running() {
