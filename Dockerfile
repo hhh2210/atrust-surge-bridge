@@ -8,7 +8,12 @@ RUN apt-get update \
 
 COPY container/xdg-open /usr/bin/xdg-open
 COPY container/entrypoint.sh /usr/local/bin/atrust-surge-entrypoint
-RUN chmod 0755 /usr/bin/xdg-open /usr/local/bin/atrust-surge-entrypoint
+COPY patches/patch-novnc-ui.awk /tmp/patch-novnc-ui.awk
+RUN awk -f /tmp/patch-novnc-ui.awk /usr/local/share/novnc/app/ui.js \
+      > /usr/local/share/novnc/app/ui.js.patched \
+    && mv /usr/local/share/novnc/app/ui.js.patched /usr/local/share/novnc/app/ui.js \
+    && rm /tmp/patch-novnc-ui.awk \
+    && chmod 0755 /usr/bin/xdg-open /usr/local/bin/atrust-surge-entrypoint
 
 LABEL org.opencontainers.image.title="aTrust Surge bridge" \
       org.opencontainers.image.description="Pinned aTrust 2.5.16.20 arm64 image with an in-container login browser"

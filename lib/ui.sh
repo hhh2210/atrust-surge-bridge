@@ -57,6 +57,29 @@ hitsz_ui_render_status() {
     '  hitsz up   校外启动    hitsz down   校内/关闭    hitsz   菜单'
 }
 
+hitsz_ui_show_vnc_credential() {
+  local password="$1"
+  if ! hitsz_ui_enabled; then
+    printf 'noVNC password (127.0.0.1 only): %s\n' "${password}"
+    return
+  fi
+
+  local title secret note content
+  title="$(gum style --bold --foreground "${HITSZ_UI_YELLOW}" 'noVNC 自动鉴权')"
+  secret="$(gum style --bold --foreground "${HITSZ_UI_GREEN}" "${password}")"
+  note="$(gum style --foreground "${HITSZ_UI_MUTED}" '已自动交给 127.0.0.1 noVNC；下方仅作失败兜底')"
+  content="$(printf '%s\n\n  兜底密码  %s\n  %s\n' "${title}" "${secret}" "${note}")"
+  gum style --border rounded --border-foreground "${HITSZ_UI_YELLOW}" \
+    --padding "1 2" "${content}"
+}
+
+hitsz_ui_confirm_login() {
+  gum confirm --prompt.foreground "${HITSZ_UI_PURPLE}" \
+    --selected.background "${HITSZ_UI_PURPLE}" \
+    --affirmative '已登录，继续验证' --negative '稍后再说' \
+    '请在 noVNC 中完成 aTrust 登录'
+}
+
 hitsz_ui_run_action() {
   local title="$1" script="$2" action="$3" log_file
   log_file="$(mktemp -t hitsz-ui.XXXXXX)"
@@ -70,7 +93,8 @@ hitsz_ui_run_action() {
   fi
 
   gum log --level error '操作失败；底层日志如下'
-  tail -30 "${log_file}" >&2
+  tail -30 "${log_file}" | sed -E \
+    's/^(Password:).*/\1 <redacted; run hitsz login>/' >&2
   rm -f "${log_file}"
   return 1
 }
@@ -79,10 +103,12 @@ hitsz_ui_choose_action() {
   local choice
   choice="$(gum choose --cursor.foreground "${HITSZ_UI_PURPLE}" \
     --header.foreground "${HITSZ_UI_PURPLE}" --header 'HITSZ 网络访问' \
-    '查看状态' '校外：启动 aTrust' '校内/不用：关闭 Docker')" || return 1
+    '查看状态' '校外：启动 aTrust' '登录：打开 noVNC' \
+    '校内/不用：关闭 Docker')" || return 1
   case "${choice}" in
     '查看状态') printf 'status\n' ;;
     '校外：启动 aTrust') printf 'up\n' ;;
+    '登录：打开 noVNC') printf 'login\n' ;;
     '校内/不用：关闭 Docker') printf 'down\n' ;;
   esac
 }

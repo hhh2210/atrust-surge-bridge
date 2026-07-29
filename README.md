@@ -35,7 +35,7 @@ Surge Enhanced Mode
 Install the command-line dependencies:
 
 ```bash
-brew install colima docker docker-compose docker-buildx gum
+brew install colima docker docker-compose docker-buildx jq gum
 ```
 
 `gum` is optional. Without it, `hitsz` automatically uses plain text.
@@ -84,6 +84,9 @@ hitsz
 # Outside campus: start and verify isolated aTrust
 hitsz up
 
+# Reopen noVNC with its loopback-only VNC credential filled automatically
+hitsz login
+
 # On campus or when unused: stop Docker and Colima
 hitsz down
 
@@ -107,10 +110,13 @@ The TUI uses a compact color card in an interactive terminal. Set
 ```
 
 `hitsz up` starts a native-arm64 Colima VM limited to 1 CPU, 1 GiB RAM, and an
-8 GiB sparse disk. It waits for the aTrust route, opens loopback-only noVNC if
-interactive login is required, repairs the known Dante/FakeDNS cache mismatch,
-and retests the Surge group. `hitsz down` removes the container and stops the
-VM while preserving the named login volumes.
+8 GiB sparse disk. If interactive login is required, the spinner stops first,
+shows a fallback credential card, and opens noVNC with the local VNC credential
+already filled. The secret travels only in a URL fragment (which browsers do
+not send to the HTTP server), and the bundled noVNC page removes that fragment
+as soon as it caches the credential. After login, the command repairs the known
+Dante/FakeDNS cache mismatch and retests the Surge group. `hitsz down` removes
+the container and stops the VM while preserving all three login-state volumes.
 
 ## Surge policy
 
@@ -158,12 +164,14 @@ timeout is two seconds and can be changed with `HITSZ_DIRECT_PROBE_TIMEOUT`.
 The login UI is available only on loopback:
 
 ```text
-http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale
+http://127.0.0.1:6080/vnc.html
 ```
 
-The named volumes preserve container-local aTrust databases, device identity,
-and login state. Runtime sockets and lock files are removed at start. The
-launcher never stores or types school credentials. Close the in-container
+The named volumes preserve `/root`, `/home/sangfor`, and
+`/usr/share/sangfor/.aTrust`, covering Chromium/aTrust cookies, per-user aTrust
+settings, device identity, and system databases. Runtime sockets and lock files
+are removed at start. Only the generated loopback VNC password is auto-filled;
+the launcher never stores or types school credentials. Close the in-container
 Chromium after login with:
 
 ```bash

@@ -20,18 +20,40 @@ if [[ -z "${action}" ]]; then
 fi
 
 case "${action}" in
-  __core_up)
-    hitsz_mode_up
+  __core_start)
+    hitsz_mode_start
+    ;;
+  __core_finish)
+    hitsz_mode_finish
     ;;
   __core_down)
     hitsz_mode_down
     ;;
   up | on | outside | external)
     if hitsz_ui_enabled; then
-      hitsz_ui_run_action '正在启动并验证隔离 aTrust…' "${SCRIPT_PATH}" __core_up
+      ensure_env
+      hitsz_ui_run_action '正在启动隔离 aTrust…' "${SCRIPT_PATH}" __core_start
+      if ! hitsz_vpn_ready; then
+        hitsz_ui_show_vnc_credential "$(vnc_password)"
+        hitsz_open_login
+        if ! hitsz_ui_confirm_login; then
+          hitsz_mode_status
+          exit 0
+        fi
+      fi
+      hitsz_ui_run_action '正在验证 VPN 与 Surge 路由…' "${SCRIPT_PATH}" __core_finish
       hitsz_mode_status
     else
       hitsz_mode_up
+      hitsz_mode_status
+    fi
+    ;;
+  login | vnc)
+    ensure_env
+    hitsz_ui_show_vnc_credential "$(vnc_password)"
+    hitsz_open_login
+    if hitsz_ui_enabled && hitsz_ui_confirm_login; then
+      hitsz_ui_run_action '正在验证 VPN 与 Surge 路由…' "${SCRIPT_PATH}" __core_finish
       hitsz_mode_status
     fi
     ;;
@@ -48,8 +70,9 @@ case "${action}" in
     hitsz_mode_status
     ;;
   *)
-    printf 'usage: hitsz {up|down|status}\n' >&2
+    printf 'usage: hitsz {up|login|down|status}\n' >&2
     printf '  up:   start isolated aTrust for use outside campus\n' >&2
+    printf '  login: show the loopback noVNC credential and open the login UI\n' >&2
     printf '  down: stop Docker/Colima; Surge keeps campus DIRECT access\n' >&2
     exit 64
     ;;

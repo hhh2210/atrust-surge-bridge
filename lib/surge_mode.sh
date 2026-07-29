@@ -37,20 +37,19 @@ hitsz_repair_dante_dns() {
 }
 
 hitsz_wait_until_ready() {
+  local auto_open="${1:-1}"
   local max_seconds="${HITSZ_LOGIN_WAIT_SECONDS:-180}"
   local attempts=$((max_seconds / 2))
   local opened=0 i
 
   for ((i = 1; i <= attempts; i++)); do
     if hitsz_vpn_ready; then
-      hitsz_repair_dante_dns && return 0
-      printf 'aTrust tunnel is up, but JW still fails through SOCKS.\n' >&2
-      return 1
+      return 0
     fi
 
-    if [[ "${i}" -eq 5 && "${opened}" -eq 0 ]]; then
+    if [[ "${auto_open}" -eq 1 && "${i}" -eq 5 && "${opened}" -eq 0 ]]; then
       printf 'aTrust needs login; opening loopback-only noVNC...\n'
-      open 'http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale'
+      hitsz_open_login
       opened=1
     fi
     sleep 2
@@ -131,11 +130,29 @@ hitsz_collect_status() {
 }
 
 hitsz_mode_up() {
+  hitsz_mode_start
+  hitsz_wait_until_ready 1
+  hitsz_mode_finish
+}
+
+hitsz_mode_start() {
   "${ROOT_DIR}/bin/up" --no-open
-  hitsz_wait_until_ready
+}
+
+hitsz_mode_finish() {
+  hitsz_vpn_ready || hitsz_wait_until_ready 0
+  hitsz_repair_dante_dns
   hitsz_retest_group
   hitsz_normal_jw_probe
   printf 'HITSZ outside mode is ready; Surge fallback may use aTrust.\n'
+}
+
+hitsz_open_login() {
+  nc -z -w 1 127.0.0.1 6080 >/dev/null 2>&1 || {
+    printf 'noVNC is offline; run hitsz up first.\n' >&2
+    return 1
+  }
+  open "$(novnc_autologin_url)"
 }
 
 hitsz_mode_down() {

@@ -26,6 +26,7 @@ ensure_tools() {
   require_command docker-buildx
   require_command docker-compose
   require_command nc
+  require_command jq
   ensure_docker_config
 }
 
@@ -85,6 +86,15 @@ ensure_env() {
 
 vnc_password() {
   sed -n 's/^ATRUST_VNC_PASSWORD=//p' "${ENV_FILE}"
+}
+
+novnc_autologin_url() {
+  local encoded
+  require_command jq
+  ensure_env
+  encoded="$(jq -rn --arg value "$(vnc_password)" '$value | @uri')"
+  printf 'http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale#password=%s\n' \
+    "${encoded}"
 }
 
 colima_running() {

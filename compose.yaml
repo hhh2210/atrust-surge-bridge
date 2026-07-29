@@ -27,6 +27,7 @@ services:
       VNC_SIZE: 1280x800
     volumes:
       - atrust-data:/root
+      - atrust-user-data:/home/sangfor
       - atrust-system-data:/usr/share/sangfor/.aTrust
     ports:
       - 127.0.0.1:1080:1080
@@ -45,5 +46,7 @@ services:
 volumes:
   atrust-data:
     name: atrust-surge-data
+  atrust-user-data:
+    name: atrust-surge-user-data
   atrust-system-data:
     name: atrust-surge-system-data
