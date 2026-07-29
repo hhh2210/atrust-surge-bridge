@@ -4,8 +4,8 @@ Run the HITSZ Sangfor aTrust client inside a small Colima VM while keeping
 Surge Enhanced Mode as the only host-level tunnel owner.
 
 The bridge exposes loopback-only SOCKS, HTTP, VNC, and noVNC endpoints. Surge
-uses a native fallback group that prefers campus `DIRECT` access and uses the
-container SOCKS proxy only when direct access to JW is unavailable.
+uses a persistent Surge selection that `hitsz up` switches to the container
+SOCKS proxy and `hitsz down` switches back to campus `DIRECT`.
 
 ## What it solves
 
@@ -120,11 +120,10 @@ command repairs the known Dante/FakeDNS cache mismatch and activates the Surge
 route. `hitsz down` removes the container and stops the VM while preserving all
 three login-state volumes.
 
-After the isolated tunnel passes a real JW request, `hitsz up` applies a Surge
-runtime override that pins `HITSZ` to `HITSZ-aTrust`. This avoids false-positive
-`DIRECT` latency tests outside campus. `hitsz down` clears that override before
-stopping Docker, so the static fallback group can select campus `DIRECT` again.
-Neither command edits or reloads the Surge profile.
+After the isolated tunnel passes a real JW request, `hitsz up` persists the
+`HITSZ` selection as `HITSZ-aTrust`. This avoids false-positive `DIRECT` latency
+tests outside campus and survives a Surge reload. `hitsz down` selects `DIRECT`
+before stopping Docker. Neither command edits or reloads the Surge profile.
 
 ## Surge policy
 
@@ -135,12 +134,11 @@ The detached proxy is:
 HITSZ-aTrust = socks5, 127.0.0.1, 1080
 ```
 
-The routing group performs a service-level health check and prefers direct
-access:
+The routing group is selected explicitly by the lifecycle command:
 
 ```ini
 [Proxy Group]
-HITSZ = fallback, DIRECT, HITSZ-aTrust, url=https://jw.hitsz.edu.cn/, interval=60, timeout=3, evaluate-before-use=true
+HITSZ = select, DIRECT, HITSZ-aTrust
 ```
 
 The confirmed rules are:

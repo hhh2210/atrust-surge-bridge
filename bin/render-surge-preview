@@ -36,7 +36,7 @@ awk '
   }
   $0 == "[Proxy Group]" {
     print
-    print "HITSZ = fallback, DIRECT, HITSZ-aTrust, url=https://jw.hitsz.edu.cn/, interval=60, timeout=3, evaluate-before-use=true"
+    print "HITSZ = select, DIRECT, HITSZ-aTrust"
     group_fixed=1
     next
   }

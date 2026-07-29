@@ -9,7 +9,7 @@ HITSZ_JW_URL="${HITSZ_JW_URL:-https://${HITSZ_JW_HOST}/}"
 HITSZ_JW_REAL_IP="${HITSZ_JW_IP:-10.248.17.16}"
 
 hitsz_vpn_ready() {
-  colima_running && container_running &&
+  container_running &&
     docker_ctx exec "${CONTAINER_NAME}" sh -c \
       'ip -4 addr show dev utun7 2>/dev/null | grep -q "inet 10\.251\."'
 }
@@ -63,21 +63,16 @@ hitsz_retest_group() {
   "${SURGE_CLI}" test-group "${HITSZ_GROUP}"
 }
 
-hitsz_current_policy_override() {
-  "${SURGE_CLI}" --raw environment 2>/dev/null | jq -r --arg group "${HITSZ_GROUP}" \
-    '.environment.AutoPolicyGroupOverride[$group] // empty'
-}
-
-hitsz_set_atrust_policy_override() {
+hitsz_set_atrust_route() {
   "${SURGE_CLI}" --raw set \
+    "ProxyGroupSelection.${HITSZ_GROUP}=HITSZ-aTrust" \
     "AutoPolicyGroupOverride.${HITSZ_GROUP}=HITSZ-aTrust" >/dev/null
-  [[ "$(hitsz_current_policy_override)" == "HITSZ-aTrust" ]]
 }
 
-hitsz_clear_policy_override() {
+hitsz_set_direct_route() {
   "${SURGE_CLI}" --raw set \
+    "ProxyGroupSelection.${HITSZ_GROUP}=DIRECT" \
     "AutoPolicyGroupOverride.${HITSZ_GROUP}=<nil>" >/dev/null
-  [[ -z "$(hitsz_current_policy_override)" ]]
 }
 
 hitsz_normal_jw_probe() {
@@ -106,38 +101,39 @@ hitsz_recent_jw_policy() {
 }
 
 hitsz_status_jw_code() {
-  local code attempt
-  for attempt in 1 2 3; do
-    code="$(hitsz_normal_jw_code 5 2>/dev/null || true)"
-    if [[ "${code}" =~ ^[0-9]{3}$ && "${code}" != "000" ]]; then
-      printf '%s\n' "${code}"
-      return 0
-    fi
-    sleep 0.2
-  done
+  local code
+  code="$(hitsz_normal_jw_code "${HITSZ_STATUS_TIMEOUT:-1}" 2>/dev/null || true)"
+  if [[ "${code}" =~ ^[0-9]{3}$ && "${code}" != "000" ]]; then
+    printf '%s\n' "${code}"
+    return 0
+  fi
   printf '000\n'
 }
 
 hitsz_collect_status() {
-  local override
-  HITSZ_STATUS_JW_CODE="$(hitsz_status_jw_code)"
-  override="$(hitsz_current_policy_override 2>/dev/null || true)"
-  HITSZ_STATUS_POLICY="${override:-$(hitsz_recent_jw_policy 2>/dev/null || printf 'UNKNOWN')}"
+  local jw_result jw_pid
+  jw_result="$(mktemp -t hitsz-jw.XXXXXX)"
+  hitsz_status_jw_code >"${jw_result}" &
+  jw_pid=$!
 
   HITSZ_STATUS_DOCKER="OFF"
   HITSZ_STATUS_USAGE=""
   HITSZ_STATUS_VPN="DISCONNECTED"
   HITSZ_STATUS_SOCKS="CLOSED"
 
-  if colima_running; then
+  if docker_ctx info >/dev/null 2>&1; then
     HITSZ_STATUS_DOCKER="ON"
-    wait_for_docker
     if container_running; then
       HITSZ_STATUS_USAGE="$(docker_ctx stats --no-stream --format '{{.CPUPerc}} · {{.MemUsage}}' "${CONTAINER_NAME}")"
       hitsz_vpn_ready && HITSZ_STATUS_VPN="CONNECTED"
     fi
   fi
   nc -z -w 1 127.0.0.1 1080 >/dev/null 2>&1 && HITSZ_STATUS_SOCKS="OPEN"
+
+  wait "${jw_pid}" || true
+  HITSZ_STATUS_JW_CODE="$(cat "${jw_result}")"
+  rm -f "${jw_result}"
+  HITSZ_STATUS_POLICY="$(hitsz_recent_jw_policy 2>/dev/null || printf 'UNKNOWN')"
 
   if [[ "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "DIRECT" ]]; then
     HITSZ_STATUS_MODE="校园直连"
@@ -161,9 +157,9 @@ hitsz_mode_start() {
 hitsz_mode_finish() {
   hitsz_vpn_ready || hitsz_wait_until_ready 0
   hitsz_repair_dante_dns
-  hitsz_set_atrust_policy_override
+  hitsz_set_atrust_route
   if ! hitsz_normal_jw_probe; then
-    hitsz_clear_policy_override || true
+    hitsz_set_direct_route || true
     printf 'aTrust SOCKS is ready, but the Surge HITSZ route still failed.\n' >&2
     return 1
   fi
@@ -179,7 +175,7 @@ hitsz_open_login() {
 }
 
 hitsz_mode_down() {
-  hitsz_clear_policy_override || true
+  hitsz_set_direct_route || true
   "${ROOT_DIR}/bin/down"
   hitsz_retest_group || true
   if hitsz_normal_jw_probe; then
