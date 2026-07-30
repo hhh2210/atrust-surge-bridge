@@ -90,7 +90,7 @@ hitsz login
 # On campus or when unused: stop Docker and Colima
 hitsz down
 
-# Show routing, JW health, VM, VPN, and SOCKS state
+# Show routing, JW health, VM, VPN, and SOCKS state (read-only)
 hitsz status
 ```
 
@@ -116,14 +116,63 @@ already filled. The secret travels only in a URL fragment (which browsers do
 not send to the HTTP server). A cache-resistant entry page removes it before
 loading noVNC and receives a non-secret nonce on every open, so an older cached
 noVNC module cannot leave the password in the address bar. After login, the
-command repairs the known Dante/FakeDNS cache mismatch and activates the Surge
-route. `hitsz down` removes the container and stops the VM while preserving all
-three login-state volumes.
+command repairs the known Dante/FakeDNS cache mismatch, activates the Surge
+route, verifies a real JW request, and stops the login-only Chromium process to
+release VM memory. `hitsz down` removes the container and stops the VM while
+preserving all three login-state volumes.
+
+On startup, `hitsz up` first gives the trusted-terminal flow 30 seconds to
+renew silently. For the pinned aTrust 2.5.16.20 client, it uses a fail-closed
+GUI guard: the client window must be uniquely visible, owned by the expected
+`aTrustTray` process, match the expected geometry, and show `Log In` in an OCR
+crop before one coordinate click is sent. The click only launches the isolated
+browser; no credential is passed to it. A 30-second cooldown and a shared
+browser lock make concurrent host/keeper triggers idempotent. If the guard or
+renewal fails, `hitsz up` opens noVNC instead. The default geometry can be
+adapted with the `ATRUST_LOGIN_*` variables in `compose.yaml` when a client
+version or display scale changes. Failed OCR/window verification is sampled at
+most three times and backs off for five minutes instead of polling continuously.
+
+While the container remains running, a tiny in-container keeper repeats that
+guarded trigger after a session timeout. After the restored route stays healthy
+for 30 seconds, it asks only the profile-scoped Chromium root process to
+terminate, waits for every profile-identifiable Chromium/crashpad process to
+exit, and then removes unowned stale singleton files. A timeout is reported as
+a warning instead of a clean stop.
+If a manual/CAS login remains offline for 10 minutes, the keeper cleanly closes
+Chromium and latches automatic retries off. This prevents both an unattended
+browser from exhausting the 1 GiB VM and a stale saved password from being
+resubmitted until account lockout. `hitsz login` or a new `hitsz up` grants one
+fresh 60-second, one-shot browser-open permit while automatic retries remain
+latched; the latch is cleared only after tunnel health returns. Override the
+10-minute offline-browser timeout with `ATRUST_BROWSER_OFFLINE_TTL_SECONDS`;
+failed OCR triggers separately back off for five minutes.
+If the trusted-device grant itself expires, the browser remains open for manual
+SSO and `hitsz status` reports `需重新登录`. On the exact HITSZ CAS login origin,
+a bundled extension first verifies that the CAS `service` target is the HITSZ
+aTrust callback, then waits for Chromium's native password autofill, opts into
+the form's seven-day `rememberMe` session, and clicks the exact scoped submit
+control once. The extension never reads field values and has no network
+permissions. Project code never receives or writes the school password, but if
+you enable Chromium's password manager, its saved-password database is part of
+the persistent `atrust-surge-data` browser profile. Treat that volume as
+sensitive login state. After a successful CAS return, the launcher requires 30
+continuous seconds of healthy tunnel routing, verifies JW again, requests the
+clean browser shutdown described above, and performs one final JW request
+before reporting success.
 
 After the isolated tunnel passes a real JW request, `hitsz up` persists the
 `HITSZ` selection as `HITSZ-aTrust`. This avoids false-positive `DIRECT` latency
 tests outside campus and survives a Surge reload. `hitsz down` selects `DIRECT`
 before stopping Docker. Neither command edits or reloads the Surge profile.
+
+`hitsz status` reads that live selection directly from Surge. When aTrust is
+selected but its tunnel is disconnected, status skips the JW request and shows
+`需重新登录` instead of sending traffic into an unavailable SOCKS path. The
+container also rejects the verified HITSZ private range `10.248.0.0/15` unless
+Linux routes it through `utun7`; this prevents a disconnected tunnel from
+feeding the same request back into Surge Enhanced Mode without blocking
+aTrust's pre-tunnel FakeIP login flow.
 
 ## Surge policy
 
@@ -181,10 +230,15 @@ http://127.0.0.1:6080/atrust-vnc.html
 
 The named volumes preserve `/root`, `/home/sangfor`, and
 `/usr/share/sangfor/.aTrust`, covering Chromium/aTrust cookies, per-user aTrust
-settings, device identity, and system databases. Runtime sockets and lock files
-are removed at start. Only the generated loopback VNC password is auto-filled;
-the launcher never stores or types school credentials. Close the in-container
-Chromium after login with:
+settings, device identity, and system databases. Runtime sockets and stale
+singleton files are removed only when no profile-scoped browser process or
+socket owner remains. The launcher itself only auto-fills the generated
+loopback VNC password; browser-native autofill remains Chromium's
+responsibility and may
+persist a saved password under `/root` as described above. A school-side
+session timeout can still require a fresh browser login even though these local
+volumes remain intact. A successful `hitsz up` closes Chromium automatically;
+the manual fallback is:
 
 ```bash
 ./bin/trim-browser
@@ -193,6 +247,13 @@ Chromium after login with:
 ## Security boundaries
 
 - All published ports bind to `127.0.0.1`.
+- The verified HITSZ private range `10.248.0.0/15` fails closed unless it uses
+  container interface `utun7`; aTrust FakeIP remains available for pre-tunnel
+  login.
+- Automatic CAS submit is restricted to the exact HITSZ CAS origin and the
+  `https://trust.hitsz.edu.cn/passport/v1/auth/cas/` service target.
+- The persistent volumes can contain cookies, device identity, session state,
+  and Chromium-saved passwords. Protect Docker/Colima storage as credentials.
 - `.env`, Docker credentials, buildx state, and login volumes are excluded from
   Git.
 - Do not copy native macOS aTrust state into the container.

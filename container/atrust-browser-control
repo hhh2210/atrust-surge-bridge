@@ -1,0 +1,252 @@
+#!/bin/bash
+set -euo pipefail
+
+export DISPLAY="${DISPLAY:-:1}"
+
+lock_file=/run/lock/atrust-browser-lifecycle.lock
+profile_dir=/root/.config/chromium
+trigger_stamp=/tmp/atrust-login-triggered
+failure_stamp=/tmp/atrust-login-trigger-failed
+manual_latch=/tmp/atrust-manual-login-required
+manual_open_permit=/tmp/atrust-manual-open-permit
+
+# shellcheck source=atrust-login-guard.sh
+source "${ATRUST_LOGIN_GUARD_LIB:-/usr/local/lib/atrust-login-guard.sh}"
+
+exec 9>"${lock_file}"
+flock -w "${ATRUST_BROWSER_LOCK_WAIT_SECONDS:-25}" 9 || {
+  printf 'Timed out waiting for the aTrust browser lifecycle lock.\n' >&2
+  exit 1
+}
+trap 'rm -f /tmp/atrust-login-window.*.png /tmp/atrust-login-button.*.png' EXIT
+
+managed_browser_pids() {
+  local pid process executable command_line
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] || continue
+    process="/proc/${pid}"
+    executable="$(readlink -f "${process}/exe" 2>/dev/null || true)"
+    command_line="$(tr '\0' ' ' 2>/dev/null <"${process}/cmdline" || true)"
+    if [[ "${executable}" == '/usr/lib/chromium/chromium' &&
+      "${command_line}" == *"--user-data-dir=${profile_dir}"* ]]; then
+      printf '%s\n' "${pid}"
+    elif [[ "${executable}" == '/usr/lib/chromium/chrome_crashpad_handler' &&
+      "${command_line}" == *"--database=${profile_dir}/Crash Reports"* ]]; then
+      printf '%s\n' "${pid}"
+    fi
+  done < <(pgrep -f '[c]hromium' 2>/dev/null || true)
+}
+
+browser_running() {
+  [[ -n "$(managed_browser_pids)" ]]
+}
+
+manual_permit_is_fresh() {
+  local now permit_time
+  [[ -e "${manual_open_permit}" ]] || return 1
+  now="$(date +%s)"
+  permit_time="$(stat -c '%Y' "${manual_open_permit}" 2>/dev/null || printf '0')"
+  ((now - permit_time <= 60))
+}
+
+cleanup_stale_browser_state() {
+  local socket
+  browser_running && return 1
+  socket="$(readlink -f "${profile_dir}/SingletonSocket" 2>/dev/null || true)"
+  if [[ -n "${socket}" && -S "${socket}" ]] && fuser "${socket}" >/dev/null 2>&1; then
+    printf 'Chromium singleton socket still has an owner; refusing cleanup.\n' >&2
+    return 1
+  fi
+  rm -f "${profile_dir}"/Singleton* "${profile_dir}"/Default/Singleton*
+  rm -rf /tmp/.org.chromium.Chromium.* /tmp/org.chromium.Chromium.*
+}
+
+open_browser() {
+  local _
+  [[ "$#" -gt 0 ]] || return 0
+  if [[ -e "${manual_latch}" ]] && ! manual_permit_is_fresh; then
+    printf 'Manual login is required; refusing an automatic browser reopen.\n' >&2
+    return 1
+  fi
+  rm -f "${manual_open_permit}"
+  if browser_running; then
+    nohup /usr/bin/chromium \
+      --no-sandbox \
+      --disable-dev-shm-usage \
+      --user-data-dir="${profile_dir}" \
+      --load-extension=/opt/atrust-autologin-extension \
+      "$@" \
+      >>/tmp/atrust-browser-open.log 2>&1 9>&- &
+    return 0
+  fi
+
+  cleanup_stale_browser_state
+  nohup /usr/bin/chromium \
+    --no-sandbox \
+    --disable-dev-shm-usage \
+    --user-data-dir="${profile_dir}" \
+    --load-extension=/opt/atrust-autologin-extension \
+    "$@" \
+    >/tmp/atrust-browser-open.log 2>&1 9>&- &
+  for _ in {1..50}; do
+    browser_running && return 0
+    sleep 0.1
+  done
+  touch "${manual_latch}"
+  printf 'Chromium did not start within five seconds; manual retry is required.\n' >&2
+  return 1
+}
+
+root_browser_pids() {
+  local pid command_line
+  while IFS= read -r pid; do
+    [[ -r "/proc/${pid}/cmdline" ]] || continue
+    command_line="$(tr '\0' ' ' 2>/dev/null <"/proc/${pid}/cmdline" || true)"
+    [[ "${command_line}" == *"--user-data-dir=${profile_dir}"* ]] || continue
+    [[ "${command_line}" == *'--type='* ]] || printf '%s\n' "${pid}"
+  done < <(managed_browser_pids)
+}
+
+stop_browser() {
+  local -a roots=()
+  local pid
+
+  if ! browser_running; then
+    cleanup_stale_browser_state
+    return 0
+  fi
+
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] && roots+=("${pid}")
+  done < <(root_browser_pids)
+  if [[ "${#roots[@]}" -eq 0 ]]; then
+    printf 'Chromium is running without a root browser process; refusing broad termination.\n' >&2
+    return 1
+  fi
+
+  kill -TERM "${roots[@]}" 2>/dev/null || true
+  for _ in {1..100}; do
+    if ! browser_running; then
+      cleanup_stale_browser_state
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  printf 'Chromium did not exit cleanly within 20 seconds.\n' >&2
+  return 1
+}
+
+trigger_login() {
+  local trigger_source="${1:-manual}"
+  local cooldown_seconds="${ATRUST_CLICK_COOLDOWN_SECONDS:-30}"
+  local failure_cooldown_seconds="${ATRUST_CLICK_FAILURE_COOLDOWN_SECONDS:-300}"
+  local now last_trigger last_failure
+
+  [[ "${failure_cooldown_seconds}" =~ ^[0-9]+$ ]] || failure_cooldown_seconds=300
+  if [[ "${trigger_source}" == "auto" && -e "${manual_latch}" ]]; then
+    printf 'Manual login is required; automatic browser retry is latched off.\n' >&2
+    return 1
+  fi
+  if [[ "${trigger_source}" == "manual" ]]; then
+    rm -f "${failure_stamp}"
+  fi
+
+  if ip -4 addr show dev utun7 2>/dev/null | grep -q 'inet 10\.251\.' &&
+    ip -4 route get "${HITSZ_JW_IP:-10.248.17.16}" 2>/dev/null | grep -q 'dev utun7'; then
+    printf 'The aTrust tunnel is already online; no click sent.\n'
+    return 0
+  fi
+
+  if browser_running; then
+    printf 'The isolated login browser is already running; no click sent.\n'
+    return 0
+  fi
+
+  now="$(date +%s)"
+  last_trigger="$(stat -c '%Y' "${trigger_stamp}" 2>/dev/null || printf '0')"
+  if ((now - last_trigger < cooldown_seconds)); then
+    printf 'A recent aTrust login trigger is still within the cooldown; no click sent.\n'
+    return 0
+  fi
+  last_failure="$(stat -c '%Y' "${failure_stamp}" 2>/dev/null || printf '0')"
+  if ((now - last_failure < failure_cooldown_seconds)); then
+    printf 'The previous guarded login attempt failed recently; no click sent.\n' >&2
+    return 1
+  fi
+
+  if ! atrust_find_login_target; then
+    touch "${failure_stamp}"
+    printf 'No guarded aTrust click was sent.\n' >&2
+    return 1
+  fi
+  if browser_running; then
+    printf 'The isolated login browser opened before the guarded click; no click sent.\n'
+    return 0
+  fi
+  if ip -4 addr show dev utun7 2>/dev/null | grep -q 'inet 10\.251\.' &&
+    ip -4 route get "${HITSZ_JW_IP:-10.248.17.16}" 2>/dev/null | grep -q 'dev utun7'; then
+    printf 'The aTrust tunnel came online before the guarded click; no click sent.\n'
+    return 0
+  fi
+  if ! atrust_window_metadata_matches "${ATRUST_VERIFIED_WINDOW}"; then
+    touch "${failure_stamp}"
+    printf 'The verified aTrust window changed before click; no click sent.\n' >&2
+    return 1
+  fi
+
+  xdotool windowfocus --sync "${ATRUST_VERIFIED_WINDOW}"
+  if [[ "${trigger_source}" == "manual" ]]; then
+    touch "${manual_latch}" "${manual_open_permit}"
+  fi
+  if ! xdotool mousemove --window "${ATRUST_VERIFIED_WINDOW}" \
+    "${ATRUST_VERIFIED_CLICK_X}" "${ATRUST_VERIFIED_CLICK_Y}" click 1; then
+    if [[ "${trigger_source}" == "manual" ]]; then
+      rm -f "${manual_open_permit}"
+      touch "${manual_latch}"
+    else
+      touch "${failure_stamp}"
+    fi
+    printf 'The guarded aTrust click failed; no browser permission remains.\n' >&2
+    return 1
+  fi
+  rm -f "${failure_stamp}"
+  touch "${trigger_stamp}"
+  printf 'Verified the visible Log In label and sent one guarded click.\n'
+}
+
+case "${1:-}" in
+  open)
+    shift
+    open_browser "$@"
+    ;;
+  running)
+    browser_running
+    ;;
+  stop)
+    stop_browser
+    ;;
+  stop-and-latch)
+    touch "${manual_latch}"
+    stop_browser
+    ;;
+  latch)
+    touch "${manual_latch}"
+    ;;
+  unlatch)
+    rm -f "${manual_latch}" "${manual_open_permit}"
+    ;;
+  latched)
+    [[ -e "${manual_latch}" ]]
+    ;;
+  trigger)
+    trigger_login manual
+    ;;
+  trigger-auto)
+    trigger_login auto
+    ;;
+  *)
+    printf 'usage: atrust-browser-control {open URL...|running|stop|stop-and-latch|latch|unlatch|latched|trigger|trigger-auto}\n' >&2
+    exit 64
+    ;;
+esac

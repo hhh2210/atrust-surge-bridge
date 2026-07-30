@@ -160,3 +160,21 @@ wait_for_port() {
 container_running() {
   docker_ctx inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null | grep -q '^true$'
 }
+
+stop_login_browser() {
+  container_running || return 0
+  docker_ctx exec "${CONTAINER_NAME}" \
+    /usr/local/bin/atrust-browser-control stop
+}
+
+login_browser_running() {
+  container_running &&
+    docker_ctx exec "${CONTAINER_NAME}" \
+      /usr/local/bin/atrust-browser-control running >/dev/null 2>&1
+}
+
+trigger_atrust_login() {
+  container_running || return 1
+  docker_ctx exec -e DISPLAY=:1 "${CONTAINER_NAME}" \
+    /usr/local/bin/atrust-browser-control trigger
+}

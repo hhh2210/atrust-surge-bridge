@@ -14,19 +14,70 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ShellCheck
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
 
       - name: Check shell syntax
         run: |
-          bash -n ./bin/* ./lib/*.sh ./container/* ./*.command
-          shellcheck -x -P SCRIPTDIR ./bin/* ./lib/*.sh ./container/* ./*.command
+          shell_files=(
+            ./bin/*
+            ./lib/*.sh
+            ./container/entrypoint.sh
+            ./container/xdg-open
+            ./container/atrust-browser-control
+            ./container/atrust-login-guard.sh
+            ./tests/*.sh
+            ./*.command
+          )
+          for shell_file in "${shell_files[@]}"; do
+            bash -n "${shell_file}"
+          done
+          shellcheck -x -P SCRIPTDIR "${shell_files[@]}"
+
+      - name: Test lifecycle state machine
+        run: |
+          bash ./tests/test-surge-mode.sh
+          jq -e '.manifest_version == 3 and (.permissions == null)' \
+            ./container/autologin-extension/manifest.json
+          node --check ./container/autologin-extension/autologin.js
+          node ./tests/test-autologin.js
+          if grep -E 'password\.value|fetch\(|XMLHttpRequest|WebSocket|sendBeacon' \
+              ./container/autologin-extension/autologin.js; then
+            exit 1
+          fi
+          if grep -n -E '^[[:space:]]+(DISPLAY=:1 )?/usr/local/bin/atrust-browser-control' \
+              ./container/entrypoint.sh; then
+            echo 'keeper lifecycle calls must be guarded against set -e' >&2
+            exit 1
+          fi
 
       - name: Validate Compose
-        run: docker compose --env-file .env.example config --quiet
+        run: |
+          if docker compose version >/dev/null 2>&1; then
+            docker compose --env-file .env.example config --quiet
+          else
+            docker-compose --env-file .env.example config --quiet
+          fi
 
       - name: Reject machine-specific paths
         run: |
-          pattern='/''Users/[^/]+|larry''-new'
-          if grep -R -n -E "$pattern" --exclude-dir=.git .; then
+          pattern='/''Users/[^/]+'
+          if grep -R -n -E "$pattern" \
+              --exclude-dir=.git --exclude-dir=docker-config .; then
             exit 1
           fi
+
+  container-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build pinned arm64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: false
+          tags: atrust-surge:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

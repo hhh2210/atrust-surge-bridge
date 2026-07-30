@@ -2,16 +2,19 @@
 
 # shellcheck disable=SC2034 # status globals are consumed by sourced lib/ui.sh
 
-SURGE_CLI="/Applications/Surge.app/Contents/Applications/surge-cli"
+SURGE_CLI="${SURGE_CLI:-/Applications/Surge.app/Contents/Applications/surge-cli}"
 HITSZ_GROUP="HITSZ"
 HITSZ_JW_HOST="${HITSZ_JW_HOST:-jw.hitsz.edu.cn}"
 HITSZ_JW_URL="${HITSZ_JW_URL:-https://${HITSZ_JW_HOST}/}"
 HITSZ_JW_REAL_IP="${HITSZ_JW_IP:-10.248.17.16}"
 
 hitsz_vpn_ready() {
+  # shellcheck disable=SC2016 # $1 is expanded by the in-container shell.
   container_running &&
     docker_ctx exec "${CONTAINER_NAME}" sh -c \
-      'ip -4 addr show dev utun7 2>/dev/null | grep -q "inet 10\.251\."'
+      'ip -4 addr show dev utun7 2>/dev/null | grep -q "inet 10\.251\." &&
+       ip -4 route get "$1" 2>/dev/null | grep -q "dev utun7"' \
+      sh "${HITSZ_JW_REAL_IP}"
 }
 
 hitsz_jw_via_socks() {
@@ -39,16 +42,24 @@ hitsz_repair_dante_dns() {
 hitsz_wait_until_ready() {
   local auto_open="${1:-1}"
   local max_seconds="${HITSZ_LOGIN_WAIT_SECONDS:-180}"
+  local grace_seconds="${HITSZ_TRUSTED_LOGIN_GRACE_SECONDS:-30}"
   local attempts=$((max_seconds / 2))
+  local open_attempt=$(((grace_seconds + 1) / 2))
   local opened=0 i
+
+  [[ "${open_attempt}" -ge 1 ]] || open_attempt=1
+  if [[ "${auto_open}" -eq 1 ]]; then
+    printf 'Waiting up to %ss for trusted-terminal renewal before showing noVNC...\n' \
+      "${grace_seconds}"
+  fi
 
   for ((i = 1; i <= attempts; i++)); do
     if hitsz_vpn_ready; then
       return 0
     fi
 
-    if [[ "${auto_open}" -eq 1 && "${i}" -eq 5 && "${opened}" -eq 0 ]]; then
-      printf 'aTrust needs login; opening loopback-only noVNC...\n'
+    if [[ "${auto_open}" -eq 1 && "${i}" -eq "${open_attempt}" && "${opened}" -eq 0 ]]; then
+      printf 'Trusted-terminal renewal needs attention; opening loopback-only noVNC...\n'
       hitsz_open_login
       opened=1
     fi
@@ -66,7 +77,7 @@ hitsz_retest_group() {
 hitsz_set_atrust_route() {
   "${SURGE_CLI}" --raw set \
     "ProxyGroupSelection.${HITSZ_GROUP}=HITSZ-aTrust" \
-    "AutoPolicyGroupOverride.${HITSZ_GROUP}=HITSZ-aTrust" >/dev/null
+    "AutoPolicyGroupOverride.${HITSZ_GROUP}=<nil>" >/dev/null
 }
 
 hitsz_set_direct_route() {
@@ -90,14 +101,47 @@ hitsz_normal_jw_code() {
       "${HITSZ_JW_URL}"
 }
 
-hitsz_recent_jw_policy() {
-  "${SURGE_CLI}" --raw dump request 2>/dev/null | jq -r '
-    [.. | objects
-      | select((((.hostname? // .host? // .remoteHost? // "") | tostring)
-        | test("jw\\.hitsz\\.edu\\.cn"; "i")))
-      | (.policyName? // .policy? // .finalPolicy? // empty)]
-    | last // "UNKNOWN"
-  '
+hitsz_wait_for_stable_route() {
+  local required_seconds="${HITSZ_ROUTE_STABLE_SECONDS:-30}"
+  local timeout_seconds="${HITSZ_ROUTE_STABLE_TIMEOUT_SECONDS:-75}"
+  local interval_seconds="${HITSZ_ROUTE_STABLE_INTERVAL_SECONDS:-2}"
+  local elapsed=0 stable=0 code
+
+  printf 'Verifying %ss of continuous aTrust route health...\n' \
+    "${required_seconds}"
+  while [[ "${elapsed}" -lt "${timeout_seconds}" ]]; do
+    sleep "${interval_seconds}"
+    elapsed=$((elapsed + interval_seconds))
+    if hitsz_vpn_ready; then
+      stable=$((stable + interval_seconds))
+    else
+      stable=0
+    fi
+
+    if [[ "${stable}" -ge "${required_seconds}" ]]; then
+      code="$(hitsz_normal_jw_code 8 2>/dev/null || true)"
+      if [[ "${code}" =~ ^[0-9]{3}$ && "${code}" != "000" ]]; then
+        return 0
+      fi
+      stable=0
+    fi
+  done
+
+  printf 'aTrust route did not remain healthy for %ss within the %ss deadline.\n' \
+    "${required_seconds}" "${timeout_seconds}" >&2
+  return 1
+}
+
+hitsz_surge_environment() {
+  "${SURGE_CLI}" --raw environment 2>/dev/null
+}
+
+hitsz_current_selection() {
+  local selection
+  selection="$(hitsz_surge_environment | jq -er \
+    --arg group "${HITSZ_GROUP}" \
+    '.environment.ProxyGroupSelection[$group] // "UNKNOWN"' 2>/dev/null)" || selection="UNKNOWN"
+  printf '%s\n' "${selection}"
 }
 
 hitsz_status_jw_code() {
@@ -111,34 +155,39 @@ hitsz_status_jw_code() {
 }
 
 hitsz_collect_status() {
-  local jw_result jw_pid
-  jw_result="$(mktemp -t hitsz-jw.XXXXXX)"
-  hitsz_status_jw_code >"${jw_result}" &
-  jw_pid=$!
-
   HITSZ_STATUS_DOCKER="OFF"
   HITSZ_STATUS_USAGE=""
   HITSZ_STATUS_VPN="DISCONNECTED"
   HITSZ_STATUS_SOCKS="CLOSED"
+  HITSZ_STATUS_JW_CODE="SKIPPED"
+  HITSZ_STATUS_POLICY="$(hitsz_current_selection)"
 
   if docker_ctx info >/dev/null 2>&1; then
-    HITSZ_STATUS_DOCKER="ON"
+    HITSZ_STATUS_DOCKER="IDLE"
     if container_running; then
-      HITSZ_STATUS_USAGE="$(docker_ctx stats --no-stream --format '{{.CPUPerc}} · {{.MemUsage}}' "${CONTAINER_NAME}")"
+      HITSZ_STATUS_DOCKER="ON"
+      HITSZ_STATUS_USAGE="$(docker_ctx stats --no-stream \
+        --format '{{.CPUPerc}} · {{.MemUsage}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
       hitsz_vpn_ready && HITSZ_STATUS_VPN="CONNECTED"
     fi
   fi
   nc -z -w 1 127.0.0.1 1080 >/dev/null 2>&1 && HITSZ_STATUS_SOCKS="OPEN"
 
-  wait "${jw_pid}" || true
-  HITSZ_STATUS_JW_CODE="$(cat "${jw_result}")"
-  rm -f "${jw_result}"
-  HITSZ_STATUS_POLICY="$(hitsz_recent_jw_policy 2>/dev/null || printf 'UNKNOWN')"
+  case "${HITSZ_STATUS_POLICY}:${HITSZ_STATUS_VPN}" in
+    DIRECT:*)
+      HITSZ_STATUS_JW_CODE="$(hitsz_status_jw_code)"
+      ;;
+    HITSZ-aTrust:CONNECTED)
+      HITSZ_STATUS_JW_CODE="$(hitsz_status_jw_code)"
+      ;;
+  esac
 
-  if [[ "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "DIRECT" ]]; then
+  if [[ "${HITSZ_STATUS_JW_CODE}" =~ ^[0-9]{3}$ && "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "DIRECT" ]]; then
     HITSZ_STATUS_MODE="校园直连"
-  elif [[ "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "HITSZ-aTrust" ]]; then
+  elif [[ "${HITSZ_STATUS_JW_CODE}" =~ ^[0-9]{3}$ && "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "HITSZ-aTrust" ]]; then
     HITSZ_STATUS_MODE="校外 aTrust"
+  elif [[ "${HITSZ_STATUS_POLICY}" == "HITSZ-aTrust" && "${HITSZ_STATUS_DOCKER}" == "ON" && "${HITSZ_STATUS_VPN}" == "DISCONNECTED" ]]; then
+    HITSZ_STATUS_MODE="需重新登录"
   else
     HITSZ_STATUS_MODE="不可用"
   fi
@@ -146,6 +195,11 @@ hitsz_collect_status() {
 
 hitsz_mode_up() {
   hitsz_mode_start
+  if ! hitsz_vpn_ready; then
+    printf 'Triggering the aTrust client login flow...\n'
+    trigger_atrust_login ||
+      printf 'WARNING: could not trigger aTrust Log In automatically.\n' >&2
+  fi
   hitsz_wait_until_ready 1
   hitsz_mode_finish
 }
@@ -163,6 +217,20 @@ hitsz_mode_finish() {
     printf 'aTrust SOCKS is ready, but the Surge HITSZ route still failed.\n' >&2
     return 1
   fi
+  if ! hitsz_wait_for_stable_route; then
+    hitsz_set_direct_route || true
+    return 1
+  fi
+  if ! stop_login_browser; then
+    printf 'WARNING: failed to stop login Chromium; run bin/trim-browser.\n' >&2
+    return 1
+  fi
+  printf 'Login Chromium stopped to release VM memory.\n'
+  if ! hitsz_normal_jw_probe; then
+    hitsz_set_direct_route || true
+    printf 'The aTrust route failed after browser shutdown; reverted HITSZ to DIRECT.\n' >&2
+    return 1
+  fi
   printf 'HITSZ outside mode is ready; Surge is pinned to aTrust until hitsz down.\n'
 }
 
@@ -171,6 +239,10 @@ hitsz_open_login() {
     printf 'noVNC is offline; run hitsz up first.\n' >&2
     return 1
   }
+  if ! hitsz_vpn_ready && ! login_browser_running; then
+    trigger_atrust_login ||
+      printf 'WARNING: could not reopen the guarded aTrust login flow.\n' >&2
+  fi
   open "$(novnc_autologin_url)"
 }
 

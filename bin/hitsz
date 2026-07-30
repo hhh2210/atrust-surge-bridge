@@ -23,6 +23,9 @@ case "${action}" in
   __core_start)
     hitsz_mode_start
     ;;
+  __core_up)
+    hitsz_mode_up
+    ;;
   __core_finish)
     hitsz_mode_finish
     ;;
@@ -32,16 +35,11 @@ case "${action}" in
   up | on | outside | external)
     if hitsz_ui_enabled; then
       ensure_env
-      hitsz_ui_run_action '正在启动隔离 aTrust…' "${SCRIPT_PATH}" __core_start
-      if ! hitsz_vpn_ready; then
+      if ! hitsz_ui_run_action '正在启动并自动恢复可信终端…' "${SCRIPT_PATH}" __core_up; then
         hitsz_ui_show_vnc_credential "$(vnc_password)"
-        hitsz_open_login
-        if ! hitsz_ui_confirm_login; then
-          hitsz_mode_status
-          exit 0
-        fi
+        hitsz_mode_status
+        exit 1
       fi
-      hitsz_ui_run_action '正在验证 VPN 与 Surge 路由…' "${SCRIPT_PATH}" __core_finish
       hitsz_mode_status
     else
       hitsz_mode_up

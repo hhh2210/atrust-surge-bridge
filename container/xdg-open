@@ -13,8 +13,4 @@ esac
 set -- "${url}" "$@"
 
 export DISPLAY="${DISPLAY:-:1}"
-nohup /usr/bin/chromium \
-  --no-sandbox \
-  --disable-dev-shm-usage \
-  "$@" \
-  >/tmp/atrust-browser-open.log 2>&1 &
+exec /usr/local/bin/atrust-browser-control open "$@"

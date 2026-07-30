@@ -13,7 +13,11 @@ hitsz_ui_enabled() {
 
 hitsz_ui_plain_status() {
   printf 'Mode: %s\n' "${HITSZ_STATUS_MODE}"
-  printf 'JW: HTTP %s via %s\n' "${HITSZ_STATUS_JW_CODE}" "${HITSZ_STATUS_POLICY}"
+  if [[ "${HITSZ_STATUS_JW_CODE}" == "SKIPPED" ]]; then
+    printf 'JW: SKIPPED via %s (VPN tunnel unavailable)\n' "${HITSZ_STATUS_POLICY}"
+  else
+    printf 'JW: HTTP %s via %s\n' "${HITSZ_STATUS_JW_CODE}" "${HITSZ_STATUS_POLICY}"
+  fi
   printf 'Docker: %s%s\n' "${HITSZ_STATUS_DOCKER}" "${HITSZ_STATUS_USAGE:+ (${HITSZ_STATUS_USAGE})}"
   printf 'VPN: %s\n' "${HITSZ_STATUS_VPN}"
   printf 'SOCKS: 127.0.0.1:1080 %s\n' "${HITSZ_STATUS_SOCKS}"
@@ -31,14 +35,22 @@ hitsz_ui_render_status() {
     "校外 aTrust") mode_color="${HITSZ_UI_YELLOW}" ;;
     *) mode_color="${HITSZ_UI_RED}" ;;
   esac
-  [[ "${HITSZ_STATUS_JW_CODE}" != "000" ]] && jw_color="${HITSZ_UI_GREEN}" || jw_color="${HITSZ_UI_RED}"
+  case "${HITSZ_STATUS_JW_CODE}" in
+    SKIPPED) jw_color="${HITSZ_UI_MUTED}" ;;
+    000) jw_color="${HITSZ_UI_RED}" ;;
+    *) jw_color="${HITSZ_UI_GREEN}" ;;
+  esac
   [[ "${HITSZ_STATUS_DOCKER}" == "OFF" ]] && docker_color="${HITSZ_UI_MUTED}" || docker_color="${HITSZ_UI_YELLOW}"
   [[ "${HITSZ_STATUS_VPN}" == "CONNECTED" ]] && vpn_color="${HITSZ_UI_GREEN}" || vpn_color="${HITSZ_UI_MUTED}"
 
   local title mode jw_value docker_value vpn_value socks_value content
   title="$(gum style --bold --foreground "${HITSZ_UI_PURPLE}" 'HITSZ ACCESS')"
   mode="$(gum style --bold --foreground "${mode_color}" "● ${HITSZ_STATUS_MODE}")"
-  jw_value="$(gum style --bold --foreground "${jw_color}" "HTTP ${HITSZ_STATUS_JW_CODE} · ${HITSZ_STATUS_POLICY}")"
+  if [[ "${HITSZ_STATUS_JW_CODE}" == "SKIPPED" ]]; then
+    jw_value="$(gum style --bold --foreground "${jw_color}" "未探测 · ${HITSZ_STATUS_POLICY}")"
+  else
+    jw_value="$(gum style --bold --foreground "${jw_color}" "HTTP ${HITSZ_STATUS_JW_CODE} · ${HITSZ_STATUS_POLICY}")"
+  fi
   docker_value="$(gum style --foreground "${docker_color}" "${HITSZ_STATUS_DOCKER}${HITSZ_STATUS_USAGE:+ · ${HITSZ_STATUS_USAGE}}")"
   vpn_value="$(gum style --foreground "${vpn_color}" "${HITSZ_STATUS_VPN}")"
   socks_value="$(gum style --foreground "${docker_color}" "127.0.0.1:1080 · ${HITSZ_STATUS_SOCKS}")"
