@@ -7,8 +7,31 @@ ROOT_DIR="$(unset CDPATH; cd -- "$(dirname -- "${SCRIPT_PATH}")/.." && pwd)"
 source "${ROOT_DIR}/lib/common.sh"
 # shellcheck source=../lib/surge_mode.sh
 source "${ROOT_DIR}/lib/surge_mode.sh"
+# shellcheck source=../lib/status.sh
+source "${ROOT_DIR}/lib/status.sh"
 # shellcheck source=../lib/ui.sh
 source "${ROOT_DIR}/lib/ui.sh"
+
+hitsz_ui_activate_and_settle() {
+  local stable_seconds="${HITSZ_ROUTE_STABLE_SECONDS:-30}"
+  local activate_step="${1:-2/3}" settle_step="${2:-3/3}"
+  [[ "${stable_seconds}" =~ ^[0-9]+$ ]] || stable_seconds=30
+
+  if ! hitsz_ui_run_action "${activate_step} VPN 已连；接入 Surge 并验证 JW…" \
+      "${SCRIPT_PATH}" __core_activate; then
+    hitsz_ui_warn_activation_failed "$(hitsz_current_selection)"
+    hitsz_mode_status
+    return 1
+  fi
+  hitsz_ui_mark_network_ready
+  if ! hitsz_ui_run_action \
+      "${settle_step} 网络已通；验收 ${stable_seconds} 秒稳定性并回收浏览器…" \
+      "${SCRIPT_PATH}" __core_settle; then
+    hitsz_mode_status
+    return 1
+  fi
+  hitsz_mode_status
+}
 
 action="${1:-}"
 if [[ -z "${action}" ]]; then
@@ -26,6 +49,15 @@ case "${action}" in
   __core_up)
     hitsz_mode_up
     ;;
+  __core_connect)
+    hitsz_mode_connect
+    ;;
+  __core_activate)
+    hitsz_mode_activate_route
+    ;;
+  __core_settle)
+    hitsz_mode_settle
+    ;;
   __core_finish)
     hitsz_mode_finish
     ;;
@@ -35,12 +67,13 @@ case "${action}" in
   up | on | outside | external)
     if hitsz_ui_enabled; then
       ensure_env
-      if ! hitsz_ui_run_action '正在启动并自动恢复可信终端…' "${SCRIPT_PATH}" __core_up; then
+      if ! hitsz_ui_run_action '1/3 启动隔离 aTrust 并恢复会话…' \
+          "${SCRIPT_PATH}" __core_connect; then
         hitsz_ui_show_vnc_credential "$(vnc_password)"
         hitsz_mode_status
         exit 1
       fi
-      hitsz_mode_status
+      hitsz_ui_activate_and_settle
     else
       hitsz_mode_up
       hitsz_mode_status
@@ -51,8 +84,7 @@ case "${action}" in
     hitsz_ui_show_vnc_credential "$(vnc_password)"
     hitsz_open_login
     if hitsz_ui_enabled && hitsz_ui_confirm_login; then
-      hitsz_ui_run_action '正在验证 VPN 与 Surge 路由…' "${SCRIPT_PATH}" __core_finish
-      hitsz_mode_status
+      hitsz_ui_activate_and_settle '1/2' '2/2'
     fi
     ;;
   down | off | inside | direct)

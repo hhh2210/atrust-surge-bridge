@@ -121,6 +121,22 @@ route, verifies a real JW request, and stops the login-only Chromium process to
 release VM memory. `hitsz down` removes the container and stops the VM while
 preserving all three login-state volumes.
 
+In an interactive terminal, `hitsz up` renders those operations as three
+synchronous phases: restore the isolated tunnel, activate the Surge route and
+pass the first JW request, then observe 30 seconds of continuous health and
+release Chromium. A green `网络已可用` milestone appears immediately after the
+first JW request succeeds. The final phase remains foreground work so a route
+regression or browser-cleanup failure still produces a visible nonzero result.
+If the bridge container is already running, `hitsz up` reuses it instead of
+rebuilding the image or recreating the container. This keeps a healthy aTrust
+session stable when the command is repeated. Route activation allows up to 30
+seconds for the real JW SOCKS path to become usable; on failure it requests
+`DIRECT`, verifies the live Surge selection, and reports an error if that
+rollback cannot be confirmed. It points the operator to `hitsz login` when
+fresh authentication is required. After pulling a revision that changes the
+Docker image or container scripts, run `hitsz down` once before the next
+`hitsz up` so the new image is built and deployed.
+
 On startup, `hitsz up` first gives the trusted-terminal flow 30 seconds to
 renew silently. For the pinned aTrust 2.5.16.20 client, it uses a fail-closed
 GUI guard: the client window must be uniquely visible, owned by the expected
@@ -148,7 +164,8 @@ latched; the latch is cleared only after tunnel health returns. Override the
 10-minute offline-browser timeout with `ATRUST_BROWSER_OFFLINE_TTL_SECONDS`;
 failed OCR triggers separately back off for five minutes.
 If the trusted-device grant itself expires, the browser remains open for manual
-SSO and `hitsz status` reports `需重新登录`. On the exact HITSZ CAS login origin,
+SSO; once automatic retries are latched, `hitsz status` reports `需手动登录`.
+On the exact HITSZ CAS login origin,
 a bundled extension first verifies that the CAS `service` target is the HITSZ
 aTrust callback, then waits for Chromium's native password autofill, opts into
 the form's seven-day `rememberMe` session, and clicks the exact scoped submit
@@ -163,12 +180,17 @@ before reporting success.
 
 After the isolated tunnel passes a real JW request, `hitsz up` persists the
 `HITSZ` selection as `HITSZ-aTrust`. This avoids false-positive `DIRECT` latency
-tests outside campus and survives a Surge reload. `hitsz down` selects `DIRECT`
-before stopping Docker. Neither command edits or reloads the Surge profile.
+tests outside campus and survives a Surge reload. `hitsz down` selects and
+verifies `DIRECT` before stopping Docker; if the live selection cannot be
+verified, it leaves the bridge running and exits with an error. Neither command
+edits or reloads the Surge profile.
 
 `hitsz status` reads that live selection directly from Surge. When aTrust is
 selected but its tunnel is disconnected, status skips the JW request and shows
-`需重新登录` instead of sending traffic into an unavailable SOCKS path. The
+`登录恢复中` while the isolated browser is active, `待自动恢复` while the
+keeper may still renew the trusted session, or `需手动登录` only when its retry
+latch is set and no login browser remains. It never sends the status probe into
+an unavailable SOCKS path. The
 container also rejects the verified HITSZ private range `10.248.0.0/15` unless
 Linux routes it through `utun7`; this prevents a disconnected tunnel from
 feeding the same request back into Surge Enhanced Mode without blocking

@@ -8,6 +8,8 @@ TEST_ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
 source "${TEST_ROOT}/lib/common.sh"
 # shellcheck source=../lib/surge_mode.sh
 source "${TEST_ROOT}/lib/surge_mode.sh"
+# shellcheck source=../lib/status.sh
+source "${TEST_ROOT}/lib/status.sh"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
@@ -66,7 +68,39 @@ test_disconnected_atrust_skips_probe() (
   [[ ! -e "${marker}" ]] || fail 'disconnected aTrust must not probe JW'
   assert_eq 'SKIPPED' "${HITSZ_STATUS_JW_CODE}" 'disconnected JW state'
   assert_eq 'HITSZ-aTrust' "${HITSZ_STATUS_POLICY}" 'disconnected policy'
-  assert_eq '需重新登录' "${HITSZ_STATUS_MODE}" 'disconnected mode'
+  assert_eq '待自动恢复' "${HITSZ_STATUS_MODE}" 'disconnected mode'
+)
+
+test_manual_latch_requires_login() (
+  mock_running_container
+  hitsz_current_selection() { printf 'HITSZ-aTrust\n'; }
+  hitsz_vpn_ready() { return 1; }
+  login_browser_running() {
+    assert_eq '1' "${1:-}" 'status browser lock budget'
+    return 1
+  }
+  manual_login_latched() {
+    assert_eq '1' "${1:-}" 'status latch lock budget'
+    return 0
+  }
+
+  hitsz_collect_status
+  assert_eq 'SKIPPED' "${HITSZ_STATUS_JW_CODE}" 'manual latch JW state'
+  assert_eq '需手动登录' "${HITSZ_STATUS_MODE}" 'manual latch mode'
+)
+
+test_active_login_browser_is_in_progress() (
+  mock_running_container
+  hitsz_current_selection() { printf 'HITSZ-aTrust\n'; }
+  hitsz_vpn_ready() { return 1; }
+  login_browser_running() {
+    assert_eq '1' "${1:-}" 'active browser lock budget'
+    return 0
+  }
+  manual_login_latched() { return 0; }
+
+  hitsz_collect_status
+  assert_eq '登录恢复中' "${HITSZ_STATUS_MODE}" 'active login browser mode'
 )
 
 test_direct_still_probes() (
@@ -139,7 +173,7 @@ test_stats_race_does_not_abort_status() (
   hitsz_collect_status
   assert_eq 'ON' "${HITSZ_STATUS_DOCKER}" 'container state during stats race'
   assert_eq '' "${HITSZ_STATUS_USAGE}" 'stats race usage'
-  assert_eq '需重新登录' "${HITSZ_STATUS_MODE}" 'stats race mode'
+  assert_eq '待自动恢复' "${HITSZ_STATUS_MODE}" 'stats race mode'
 )
 
 test_trusted_renewal_avoids_novnc() (
@@ -182,6 +216,8 @@ test_mode_up_triggers_client_login() (
   trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
   trap 'rm -f "${trace}"' EXIT
 
+  ensure_bridge_preflight() { printf 'preflight\n' >>"${trace}"; }
+  atrust_bridge_running() { return 1; }
   hitsz_mode_start() { printf 'start\n' >>"${trace}"; }
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 1; }
   trigger_atrust_login() { printf 'trigger\n' >>"${trace}"; }
@@ -189,8 +225,54 @@ test_mode_up_triggers_client_login() (
   hitsz_mode_finish() { printf 'finish\n' >>"${trace}"; }
 
   hitsz_mode_up >/dev/null
-  expected=$'start\nvpn\ntrigger\nwait:1\nfinish'
+  expected=$'preflight\nstart\nvpn\ntrigger\nwait:1\nfinish'
   assert_eq "${expected}" "$(cat "${trace}")" 'mode up login trigger order'
+)
+
+test_connect_reuses_running_container() (
+  local trace expected
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  ensure_bridge_preflight() { printf 'preflight\n' >>"${trace}"; }
+  atrust_bridge_running() { printf 'reuse\n' >>"${trace}"; return 0; }
+  hitsz_mode_start() { printf 'start\n' >>"${trace}"; }
+  hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
+  trigger_atrust_login() { printf 'trigger\n' >>"${trace}"; }
+  hitsz_wait_until_ready() { printf 'wait\n' >>"${trace}"; }
+
+  hitsz_mode_connect >/dev/null
+  expected=$'preflight\nreuse\nvpn'
+  assert_eq "${expected}" "$(cat "${trace}")" 'running bridge reuse'
+)
+
+test_preflight_failure_blocks_reuse() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  ensure_bridge_preflight() { printf 'preflight-failed\n' >>"${trace}"; return 1; }
+  atrust_bridge_running() { printf 'reuse\n' >>"${trace}"; return 0; }
+
+  if hitsz_mode_connect >/dev/null 2>&1; then
+    fail 'failed host-isolation preflight must block bridge reuse'
+  fi
+  assert_eq 'preflight-failed' "$(cat "${trace}")" 'preflight safety gate'
+)
+
+test_preflight_stops_at_first_failure() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  ensure_tools() { printf 'tools-failed\n' >>"${trace}"; return 1; }
+  ensure_host_isolated() { printf 'host\n' >>"${trace}"; return 0; }
+  ensure_env() { printf 'env\n' >>"${trace}"; return 0; }
+
+  if ensure_bridge_preflight; then
+    fail 'preflight must propagate an ordinary tool setup failure'
+  fi
+  assert_eq 'tools-failed' "$(cat "${trace}")" 'preflight first failure boundary'
 )
 
 test_route_stability_requires_consecutive_health() (
@@ -207,6 +289,99 @@ test_route_stability_requires_consecutive_health() (
 
   hitsz_wait_for_stable_route >/dev/null
   assert_eq '5' "${checks}" 'consecutive stability checks'
+)
+
+test_socks_path_retries_until_usable() (
+  local attempts=0
+  HITSZ_ROUTE_ACTIVATION_TIMEOUT_SECONDS=30
+  HITSZ_ROUTE_ACTIVATION_INTERVAL_SECONDS=1
+  hitsz_repair_dante_dns() {
+    attempts=$((attempts + 1))
+    [[ "${attempts}" -ge 3 ]]
+  }
+  sleep() { :; }
+
+  hitsz_wait_for_socks_path
+  assert_eq '3' "${attempts}" 'SOCKS path retry count'
+)
+
+test_activate_route_stops_at_usability_boundary() (
+  local trace expected
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
+  hitsz_repair_dante_dns() { printf 'repair\n' >>"${trace}"; }
+  hitsz_set_atrust_route() { printf 'route\n' >>"${trace}"; }
+  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 0; }
+  hitsz_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
+  stop_login_browser() { printf 'trim\n' >>"${trace}"; return 0; }
+
+  hitsz_mode_activate_route >/dev/null
+  expected=$'vpn\nrepair\nroute\nprobe'
+  assert_eq "${expected}" "$(cat "${trace}")" 'route usability boundary'
+)
+
+test_restore_direct_verifies_live_selection() (
+  local mock_selection='HITSZ-aTrust'
+  hitsz_set_direct_route() { return 0; }
+  hitsz_current_selection() { printf '%s\n' "${mock_selection}"; }
+
+  if hitsz_restore_direct_route >/dev/null 2>&1; then
+    fail 'DIRECT rollback must fail when the live selection disagrees'
+  fi
+  mock_selection='DIRECT'
+  hitsz_restore_direct_route
+)
+
+test_route_selection_failure_rolls_back() (
+  local trace expected
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
+  hitsz_wait_for_socks_path() { printf 'socks\n' >>"${trace}"; return 0; }
+  hitsz_set_atrust_route() { printf 'route-failed\n' >>"${trace}"; return 1; }
+  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; return 0; }
+  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 0; }
+
+  if hitsz_mode_activate_route >/dev/null 2>&1; then
+    fail 'failed HITSZ-aTrust selection must fail activation'
+  fi
+  expected=$'vpn\nsocks\nroute-failed\ndirect'
+  assert_eq "${expected}" "$(cat "${trace}")" 'selection failure rollback'
+)
+
+test_tunnel_readiness_failure_rolls_back() (
+  local trace expected
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 1; }
+  hitsz_wait_until_ready() { printf 'wait:%s\n' "$1" >>"${trace}"; return 1; }
+  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; return 0; }
+  hitsz_wait_for_socks_path() { printf 'socks\n' >>"${trace}"; return 0; }
+
+  if hitsz_mode_activate_route >/dev/null 2>&1; then
+    fail 'failed tunnel readiness gate must fail activation'
+  fi
+  expected=$'vpn\nwait:0\ndirect'
+  assert_eq "${expected}" "$(cat "${trace}")" 'tunnel readiness failure rollback'
+)
+
+test_down_requires_verified_direct() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  hitsz_restore_direct_route() { printf 'direct-failed\n' >>"${trace}"; return 1; }
+  hitsz_retest_group() { printf 'retest\n' >>"${trace}"; }
+  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; }
+
+  if hitsz_mode_down >/dev/null 2>&1; then
+    fail 'down must fail closed when DIRECT cannot be verified'
+  fi
+  assert_eq 'direct-failed' "$(cat "${trace}")" 'down verified DIRECT gate'
 )
 
 test_finish_trims_after_success() (
@@ -236,7 +411,7 @@ test_unstable_finish_reverts_direct_without_trim() (
   hitsz_set_atrust_route() { printf 'route\n' >>"${trace}"; }
   hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 0; }
   hitsz_wait_for_stable_route() { printf 'unstable\n' >>"${trace}"; return 1; }
-  hitsz_set_direct_route() { printf 'direct\n' >>"${trace}"; }
+  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; }
   stop_login_browser() { printf 'trim\n' >>"${trace}"; return 0; }
 
   if hitsz_mode_finish >/dev/null 2>&1; then
@@ -280,7 +455,7 @@ test_post_stop_probe_failure_reverts_direct() (
   }
   hitsz_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
   stop_login_browser() { printf 'trim\n' >>"${trace}"; return 0; }
-  hitsz_set_direct_route() { printf 'direct\n' >>"${trace}"; }
+  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; }
 
   if hitsz_mode_finish >/dev/null 2>&1; then
     fail 'post-stop probe failure must fail finish'
@@ -298,7 +473,7 @@ test_failed_finish_does_not_trim() (
   hitsz_repair_dante_dns() { printf 'repair\n' >>"${trace}"; }
   hitsz_set_atrust_route() { printf 'route\n' >>"${trace}"; }
   hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 1; }
-  hitsz_set_direct_route() { printf 'direct\n' >>"${trace}"; }
+  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; }
   stop_login_browser() { printf 'trim\n' >>"${trace}"; return 0; }
 
   if hitsz_mode_finish >/dev/null 2>&1; then
@@ -311,6 +486,8 @@ test_failed_finish_does_not_trim() (
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
+  test_manual_latch_requires_login
+  test_active_login_browser_is_in_progress
   test_direct_still_probes
   test_connected_atrust_probes
   test_daemon_without_container_is_unavailable
@@ -318,7 +495,16 @@ tests=(
   test_trusted_renewal_avoids_novnc
   test_novnc_opens_after_grace
   test_mode_up_triggers_client_login
+  test_connect_reuses_running_container
+  test_preflight_failure_blocks_reuse
+  test_preflight_stops_at_first_failure
   test_route_stability_requires_consecutive_health
+  test_socks_path_retries_until_usable
+  test_activate_route_stops_at_usability_boundary
+  test_restore_direct_verifies_live_selection
+  test_route_selection_failure_rolls_back
+  test_tunnel_readiness_failure_rolls_back
+  test_down_requires_verified_direct
   test_finish_trims_after_success
   test_unstable_finish_reverts_direct_without_trim
   test_browser_stop_failure_is_visible

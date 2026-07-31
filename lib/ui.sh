@@ -33,6 +33,8 @@ hitsz_ui_render_status() {
   case "${HITSZ_STATUS_MODE}" in
     "校园直连") mode_color="${HITSZ_UI_GREEN}" ;;
     "校外 aTrust") mode_color="${HITSZ_UI_YELLOW}" ;;
+    "登录恢复中") mode_color="${HITSZ_UI_YELLOW}" ;;
+    "待自动恢复") mode_color="${HITSZ_UI_YELLOW}" ;;
     *) mode_color="${HITSZ_UI_RED}" ;;
   esac
   case "${HITSZ_STATUS_JW_CODE}" in
@@ -67,6 +69,36 @@ hitsz_ui_render_status() {
     --padding "1 2" "${content}"
   gum style --foreground "${HITSZ_UI_MUTED}" \
     '  hitsz up   校外启动    hitsz down   校内/关闭    hitsz   菜单'
+}
+
+hitsz_ui_mark_network_ready() {
+  if ! hitsz_ui_enabled; then
+    printf 'HITSZ network is available (initial JW probe passed).\n'
+    return
+  fi
+  gum style --bold --foreground "${HITSZ_UI_GREEN}" \
+    '✓ 校内网络已可用（首次 JW 探测通过）'
+}
+
+hitsz_ui_warn_activation_failed() {
+  local selection="${1:-UNKNOWN}"
+  if ! hitsz_ui_enabled; then
+    if [[ "${selection}" == "DIRECT" ]]; then
+      printf '%s\n' \
+        'HITSZ route activation failed; DIRECT is selected. Run hitsz login if reauthentication is required.' >&2
+    else
+      printf 'HITSZ route activation failed; live selection is %s.\n' \
+        "${selection}" >&2
+    fi
+    return
+  fi
+  if [[ "${selection}" == "DIRECT" ]]; then
+    gum log --level warn \
+      'HITSZ 路由未激活，已确认 DIRECT；若 aTrust 显示 Online 仍失败，请运行 hitsz login 重新鉴权'
+  else
+    gum log --level error \
+      "HITSZ 路由未激活，且 DIRECT 回退未确认；当前策略：${selection}"
+  fi
 }
 
 hitsz_ui_show_vnc_credential() {

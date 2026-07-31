@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# shellcheck disable=SC2034 # status globals are consumed by sourced lib/ui.sh
-
 SURGE_CLI="${SURGE_CLI:-/Applications/Surge.app/Contents/Applications/surge-cli}"
 HITSZ_GROUP="HITSZ"
 HITSZ_JW_HOST="${HITSZ_JW_HOST:-jw.hitsz.edu.cn}"
@@ -18,25 +16,57 @@ hitsz_vpn_ready() {
 }
 
 hitsz_jw_via_socks() {
+  local max_time="${1:-10}"
   /usr/bin/curl --socks5-hostname 127.0.0.1:1080 \
-    --connect-timeout 4 --max-time 10 --insecure --silent --show-error \
+    --connect-timeout 4 --max-time "${max_time}" --insecure --silent --show-error \
     --output /dev/null "${HITSZ_JW_URL}"
 }
 
 hitsz_jw_via_real_ip() {
+  local max_time="${1:-10}"
   /usr/bin/curl --socks5 127.0.0.1:1080 \
     --resolve "jw.hitsz.edu.cn:443:${HITSZ_JW_REAL_IP}" \
-    --connect-timeout 4 --max-time 10 --insecure --silent --show-error \
+    --connect-timeout 4 --max-time "${max_time}" --insecure --silent --show-error \
     --output /dev/null "${HITSZ_JW_URL}"
 }
 
 hitsz_repair_dante_dns() {
-  hitsz_jw_via_socks && return 0
-  hitsz_jw_via_real_ip || return 1
+  local max_time="${1:-10}"
+  hitsz_jw_via_socks "${max_time}" && return 0
+  hitsz_jw_via_real_ip "${max_time}" || return 1
   printf 'Refreshing Dante after an aTrust FakeDNS mapping change...\n'
   docker_ctx exec "${CONTAINER_NAME}" sh -c 'pkill -HUP danted'
   sleep 1
-  hitsz_jw_via_socks
+  hitsz_jw_via_socks "${max_time}"
+}
+
+hitsz_wait_for_socks_path() {
+  local timeout_seconds="${HITSZ_ROUTE_ACTIVATION_TIMEOUT_SECONDS:-30}"
+  local probe_seconds="${HITSZ_ROUTE_ACTIVATION_PROBE_SECONDS:-4}"
+  local interval_seconds="${HITSZ_ROUTE_ACTIVATION_INTERVAL_SECONDS:-2}"
+  local deadline remaining attempt_probe sleep_seconds
+
+  [[ "${timeout_seconds}" =~ ^[1-9][0-9]*$ ]] || timeout_seconds=30
+  [[ "${probe_seconds}" =~ ^[1-9][0-9]*$ ]] || probe_seconds=4
+  [[ "${interval_seconds}" =~ ^[1-9][0-9]*$ ]] || interval_seconds=2
+  deadline=$((SECONDS + timeout_seconds))
+
+  while [[ "${SECONDS}" -lt "${deadline}" ]]; do
+    remaining=$((deadline - SECONDS))
+    # One repair attempt can perform up to three curls plus a one-second HUP pause.
+    [[ "${remaining}" -ge 4 ]] || break
+    attempt_probe=$(((remaining - 1) / 3))
+    [[ "${attempt_probe}" -le "${probe_seconds}" ]] || attempt_probe="${probe_seconds}"
+    if hitsz_repair_dante_dns "${attempt_probe}"; then
+      return 0
+    fi
+    remaining=$((deadline - SECONDS))
+    [[ "${remaining}" -gt 0 ]] || break
+    sleep_seconds="${interval_seconds}"
+    [[ "${sleep_seconds}" -le "${remaining}" ]] || sleep_seconds="${remaining}"
+    sleep "${sleep_seconds}"
+  done
+  return 1
 }
 
 hitsz_wait_until_ready() {
@@ -144,81 +174,68 @@ hitsz_current_selection() {
   printf '%s\n' "${selection}"
 }
 
-hitsz_status_jw_code() {
-  local code
-  code="$(hitsz_normal_jw_code "${HITSZ_STATUS_TIMEOUT:-1}" 2>/dev/null || true)"
-  if [[ "${code}" =~ ^[0-9]{3}$ && "${code}" != "000" ]]; then
-    printf '%s\n' "${code}"
+hitsz_restore_direct_route() {
+  local selection
+  if ! hitsz_set_direct_route; then
+    printf 'Failed to request the Surge HITSZ DIRECT policy.\n' >&2
+    return 1
+  fi
+  selection="$(hitsz_current_selection)"
+  if [[ "${selection}" != "DIRECT" ]]; then
+    printf 'Surge HITSZ rollback was not verified; live selection is %s.\n' \
+      "${selection}" >&2
+    return 1
+  fi
+}
+
+hitsz_mode_connect() {
+  ensure_bridge_preflight || return 1
+  if atrust_bridge_running; then
+    printf 'The isolated aTrust container is already running; reusing it.\n'
+  else
+    hitsz_mode_start || return 1
+  fi
+  if hitsz_vpn_ready; then
     return 0
   fi
-  printf '000\n'
-}
-
-hitsz_collect_status() {
-  HITSZ_STATUS_DOCKER="OFF"
-  HITSZ_STATUS_USAGE=""
-  HITSZ_STATUS_VPN="DISCONNECTED"
-  HITSZ_STATUS_SOCKS="CLOSED"
-  HITSZ_STATUS_JW_CODE="SKIPPED"
-  HITSZ_STATUS_POLICY="$(hitsz_current_selection)"
-
-  if docker_ctx info >/dev/null 2>&1; then
-    HITSZ_STATUS_DOCKER="IDLE"
-    if container_running; then
-      HITSZ_STATUS_DOCKER="ON"
-      HITSZ_STATUS_USAGE="$(docker_ctx stats --no-stream \
-        --format '{{.CPUPerc}} · {{.MemUsage}}' "${CONTAINER_NAME}" 2>/dev/null || true)"
-      hitsz_vpn_ready && HITSZ_STATUS_VPN="CONNECTED"
-    fi
-  fi
-  nc -z -w 1 127.0.0.1 1080 >/dev/null 2>&1 && HITSZ_STATUS_SOCKS="OPEN"
-
-  case "${HITSZ_STATUS_POLICY}:${HITSZ_STATUS_VPN}" in
-    DIRECT:*)
-      HITSZ_STATUS_JW_CODE="$(hitsz_status_jw_code)"
-      ;;
-    HITSZ-aTrust:CONNECTED)
-      HITSZ_STATUS_JW_CODE="$(hitsz_status_jw_code)"
-      ;;
-  esac
-
-  if [[ "${HITSZ_STATUS_JW_CODE}" =~ ^[0-9]{3}$ && "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "DIRECT" ]]; then
-    HITSZ_STATUS_MODE="校园直连"
-  elif [[ "${HITSZ_STATUS_JW_CODE}" =~ ^[0-9]{3}$ && "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "HITSZ-aTrust" ]]; then
-    HITSZ_STATUS_MODE="校外 aTrust"
-  elif [[ "${HITSZ_STATUS_POLICY}" == "HITSZ-aTrust" && "${HITSZ_STATUS_DOCKER}" == "ON" && "${HITSZ_STATUS_VPN}" == "DISCONNECTED" ]]; then
-    HITSZ_STATUS_MODE="需重新登录"
-  else
-    HITSZ_STATUS_MODE="不可用"
-  fi
-}
-
-hitsz_mode_up() {
-  hitsz_mode_start
-  if ! hitsz_vpn_ready; then
-    printf 'Triggering the aTrust client login flow...\n'
-    trigger_atrust_login ||
-      printf 'WARNING: could not trigger aTrust Log In automatically.\n' >&2
-  fi
+  printf 'Triggering the aTrust client login flow...\n'
+  trigger_atrust_login ||
+    printf 'WARNING: could not trigger aTrust Log In automatically.\n' >&2
   hitsz_wait_until_ready 1
-  hitsz_mode_finish
 }
 
 hitsz_mode_start() {
   "${ROOT_DIR}/bin/up" --no-open
 }
 
-hitsz_mode_finish() {
-  hitsz_vpn_ready || hitsz_wait_until_ready 0
-  hitsz_repair_dante_dns
-  hitsz_set_atrust_route
+hitsz_mode_activate_route() {
+  if ! hitsz_vpn_ready; then
+    if ! hitsz_wait_until_ready 0; then
+      hitsz_restore_direct_route || true
+      return 1
+    fi
+  fi
+  if ! hitsz_wait_for_socks_path; then
+    hitsz_restore_direct_route || true
+    printf 'The aTrust tunnel is ready, but the JW SOCKS path did not become usable.\n' >&2
+    return 1
+  fi
+  if ! hitsz_set_atrust_route; then
+    hitsz_restore_direct_route || true
+    printf 'Failed to select the Surge HITSZ-aTrust policy.\n' >&2
+    return 1
+  fi
   if ! hitsz_normal_jw_probe; then
-    hitsz_set_direct_route || true
+    hitsz_restore_direct_route || true
     printf 'aTrust SOCKS is ready, but the Surge HITSZ route still failed.\n' >&2
     return 1
   fi
+  printf 'HITSZ network is available; completing stability checks...\n'
+}
+
+hitsz_mode_settle() {
   if ! hitsz_wait_for_stable_route; then
-    hitsz_set_direct_route || true
+    hitsz_restore_direct_route || true
     return 1
   fi
   if ! stop_login_browser; then
@@ -227,11 +244,24 @@ hitsz_mode_finish() {
   fi
   printf 'Login Chromium stopped to release VM memory.\n'
   if ! hitsz_normal_jw_probe; then
-    hitsz_set_direct_route || true
-    printf 'The aTrust route failed after browser shutdown; reverted HITSZ to DIRECT.\n' >&2
+    if hitsz_restore_direct_route; then
+      printf 'The aTrust route failed after browser shutdown; reverted HITSZ to DIRECT.\n' >&2
+    else
+      printf 'The aTrust route failed after browser shutdown; DIRECT rollback was not verified.\n' >&2
+    fi
     return 1
   fi
   printf 'HITSZ outside mode is ready; Surge is pinned to aTrust until hitsz down.\n'
+}
+
+hitsz_mode_finish() {
+  hitsz_mode_activate_route || return 1
+  hitsz_mode_settle
+}
+
+hitsz_mode_up() {
+  hitsz_mode_connect || return 1
+  hitsz_mode_finish
 }
 
 hitsz_open_login() {
@@ -247,23 +277,15 @@ hitsz_open_login() {
 }
 
 hitsz_mode_down() {
-  hitsz_set_direct_route || true
+  if ! hitsz_restore_direct_route; then
+    printf 'Refusing to stop the bridge because HITSZ=DIRECT was not verified.\n' >&2
+    return 1
+  fi
   "${ROOT_DIR}/bin/down"
   hitsz_retest_group || true
   if hitsz_normal_jw_probe; then
     printf 'HITSZ direct access is available on the current network.\n'
   else
     printf 'Docker is off; JW is not directly available on this network.\n'
-  fi
-}
-
-hitsz_mode_status() {
-  hitsz_collect_status
-  if declare -F hitsz_ui_render_status >/dev/null 2>&1; then
-    hitsz_ui_render_status
-  else
-    printf 'Mode: %s\nJW: HTTP %s via %s\nDocker: %s\n' \
-      "${HITSZ_STATUS_MODE}" "${HITSZ_STATUS_JW_CODE}" \
-      "${HITSZ_STATUS_POLICY}" "${HITSZ_STATUS_DOCKER}"
   fi
 }

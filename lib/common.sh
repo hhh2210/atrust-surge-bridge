@@ -84,6 +84,12 @@ ensure_env() {
   fi
 }
 
+ensure_bridge_preflight() {
+  ensure_tools || return 1
+  ensure_host_isolated || return 1
+  ensure_env || return 1
+}
+
 vnc_password() {
   sed -n 's/^ATRUST_VNC_PASSWORD=//p' "${ENV_FILE}"
 }
@@ -161,6 +167,10 @@ container_running() {
   docker_ctx inspect -f '{{.State.Running}}' "${CONTAINER_NAME}" 2>/dev/null | grep -q '^true$'
 }
 
+atrust_bridge_running() {
+  docker_ctx info >/dev/null 2>&1 && container_running
+}
+
 stop_login_browser() {
   container_running || return 0
   docker_ctx exec "${CONTAINER_NAME}" \
@@ -168,9 +178,19 @@ stop_login_browser() {
 }
 
 login_browser_running() {
+  local lock_wait="${1:-25}"
   container_running &&
-    docker_ctx exec "${CONTAINER_NAME}" \
+    docker_ctx exec -e "ATRUST_BROWSER_LOCK_WAIT_SECONDS=${lock_wait}" \
+      "${CONTAINER_NAME}" \
       /usr/local/bin/atrust-browser-control running >/dev/null 2>&1
+}
+
+manual_login_latched() {
+  local lock_wait="${1:-25}"
+  container_running &&
+    docker_ctx exec -e "ATRUST_BROWSER_LOCK_WAIT_SECONDS=${lock_wait}" \
+      "${CONTAINER_NAME}" \
+      /usr/local/bin/atrust-browser-control latched >/dev/null 2>&1
 }
 
 trigger_atrust_login() {

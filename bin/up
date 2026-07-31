@@ -6,9 +6,7 @@ source "$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)/lib/common.sh"
 open_vnc=1
 [[ "${1:-}" != "--no-open" ]] || open_vnc=0
 
-ensure_tools
-ensure_host_isolated
-ensure_env
+ensure_bridge_preflight
 
 if ! colima_running; then
   printf 'Starting isolated Colima VM (1 CPU, 1 GiB RAM)...\n'
