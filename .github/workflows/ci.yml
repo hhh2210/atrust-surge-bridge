@@ -21,6 +21,7 @@ jobs:
           shell_files=(
             ./bin/*
             ./lib/*.sh
+            ./sites/*.sh
             ./container/entrypoint.sh
             ./container/xdg-open
             ./container/atrust-browser-control
@@ -35,6 +36,8 @@ jobs:
 
       - name: Test lifecycle state machine
         run: |
+          bash ./tests/test-site-profile.sh
+          bash ./tests/test-surge-lifecycle.sh
           bash ./tests/test-surge-mode.sh
           jq -e '.manifest_version == 3 and (.permissions == null)' \
             ./container/autologin-extension/manifest.json

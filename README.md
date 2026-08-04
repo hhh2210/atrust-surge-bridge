@@ -61,6 +61,16 @@ Override it when needed:
 export SURGE_SOURCE="$HOME/path/to/your/profile.conf"
 ```
 
+## Site and backend boundary
+
+`sites/hitsz.sh` defines the Surge policies, health target, and loopback SOCKS
+endpoint. `ATRUST_SITE` selects a bundled profile (default: `hitsz`) and fails
+closed for unknown or incomplete profiles. `lib/surge_lifecycle.sh` owns the
+backend-neutral selection, live verification, probes, and rollback; the current
+`lib/surge_mode.sh` adapter supplies real-aTrust/Colima callbacks. Another
+backend can reuse that lifecycle, but still needs an explicit adapter and a
+tested staged Surge-profile renderer.
+
 Generate and validate a staging copy:
 
 ```bash

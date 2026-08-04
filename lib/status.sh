@@ -29,19 +29,20 @@ hitsz_collect_status() {
       hitsz_vpn_ready && HITSZ_STATUS_VPN="CONNECTED"
     fi
   fi
-  nc -z -w 1 127.0.0.1 1080 >/dev/null 2>&1 && HITSZ_STATUS_SOCKS="OPEN"
+  nc -z -w 1 "${SITE_SOCKS_HOST}" "${SITE_SOCKS_PORT}" >/dev/null 2>&1 &&
+    HITSZ_STATUS_SOCKS="OPEN"
 
-  case "${HITSZ_STATUS_POLICY}:${HITSZ_STATUS_VPN}" in
-    DIRECT:* | HITSZ-aTrust:CONNECTED)
-      HITSZ_STATUS_JW_CODE="$(hitsz_status_jw_code)"
-      ;;
-  esac
+  if [[ "${HITSZ_STATUS_POLICY}" == "${SITE_SURGE_DIRECT_POLICY}" ||
+    ("${HITSZ_STATUS_POLICY}" == "${SITE_SURGE_BACKEND_POLICY}" &&
+      "${HITSZ_STATUS_VPN}" == "CONNECTED") ]]; then
+    HITSZ_STATUS_JW_CODE="$(hitsz_status_jw_code)"
+  fi
 
-  if [[ "${HITSZ_STATUS_JW_CODE}" =~ ^[0-9]{3}$ && "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "DIRECT" ]]; then
+  if [[ "${HITSZ_STATUS_JW_CODE}" =~ ^[0-9]{3}$ && "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "${SITE_SURGE_DIRECT_POLICY}" ]]; then
     HITSZ_STATUS_MODE="校园直连"
-  elif [[ "${HITSZ_STATUS_JW_CODE}" =~ ^[0-9]{3}$ && "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "HITSZ-aTrust" ]]; then
+  elif [[ "${HITSZ_STATUS_JW_CODE}" =~ ^[0-9]{3}$ && "${HITSZ_STATUS_JW_CODE}" != "000" && "${HITSZ_STATUS_POLICY}" == "${SITE_SURGE_BACKEND_POLICY}" ]]; then
     HITSZ_STATUS_MODE="校外 aTrust"
-  elif [[ "${HITSZ_STATUS_POLICY}" == "HITSZ-aTrust" && "${HITSZ_STATUS_DOCKER}" == "ON" && "${HITSZ_STATUS_VPN}" == "DISCONNECTED" ]]; then
+  elif [[ "${HITSZ_STATUS_POLICY}" == "${SITE_SURGE_BACKEND_POLICY}" && "${HITSZ_STATUS_DOCKER}" == "ON" && "${HITSZ_STATUS_VPN}" == "DISCONNECTED" ]]; then
     if login_browser_running 1; then
       HITSZ_STATUS_MODE="登录恢复中"
     elif manual_login_latched 1; then

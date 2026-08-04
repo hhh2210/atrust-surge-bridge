@@ -1,10 +1,13 @@
 #!/bin/bash
 
-SURGE_CLI="${SURGE_CLI:-/Applications/Surge.app/Contents/Applications/surge-cli}"
-HITSZ_GROUP="HITSZ"
-HITSZ_JW_HOST="${HITSZ_JW_HOST:-jw.hitsz.edu.cn}"
-HITSZ_JW_URL="${HITSZ_JW_URL:-https://${HITSZ_JW_HOST}/}"
-HITSZ_JW_REAL_IP="${HITSZ_JW_IP:-10.248.17.16}"
+BRIDGE_ROUTE_STABLE_SECONDS="${HITSZ_ROUTE_STABLE_SECONDS:-${BRIDGE_ROUTE_STABLE_SECONDS:-30}}"
+BRIDGE_ROUTE_STABLE_TIMEOUT_SECONDS="${HITSZ_ROUTE_STABLE_TIMEOUT_SECONDS:-${BRIDGE_ROUTE_STABLE_TIMEOUT_SECONDS:-75}}"
+BRIDGE_ROUTE_STABLE_INTERVAL_SECONDS="${HITSZ_ROUTE_STABLE_INTERVAL_SECONDS:-${BRIDGE_ROUTE_STABLE_INTERVAL_SECONDS:-2}}"
+BRIDGE_CLEANUP_LABEL="${BRIDGE_CLEANUP_LABEL:-browser shutdown}"
+BRIDGE_SHUTDOWN_HINT="${BRIDGE_SHUTDOWN_HINT:-hitsz down}"
+
+# shellcheck source=surge_lifecycle.sh
+source "${ROOT_DIR}/lib/surge_lifecycle.sh"
 
 hitsz_vpn_ready() {
   # shellcheck disable=SC2016 # $1 is expanded by the in-container shell.
@@ -12,22 +15,22 @@ hitsz_vpn_ready() {
     docker_ctx exec "${CONTAINER_NAME}" sh -c \
       'ip -4 addr show dev utun7 2>/dev/null | grep -q "inet 10\.251\." &&
        ip -4 route get "$1" 2>/dev/null | grep -q "dev utun7"' \
-      sh "${HITSZ_JW_REAL_IP}"
+      sh "${SITE_HEALTH_REAL_IP}"
 }
 
 hitsz_jw_via_socks() {
   local max_time="${1:-10}"
-  /usr/bin/curl --socks5-hostname 127.0.0.1:1080 \
+  /usr/bin/curl --socks5-hostname "${SITE_SOCKS_HOST}:${SITE_SOCKS_PORT}" \
     --connect-timeout 4 --max-time "${max_time}" --insecure --silent --show-error \
-    --output /dev/null "${HITSZ_JW_URL}"
+    --output /dev/null "${SITE_HEALTH_URL}"
 }
 
 hitsz_jw_via_real_ip() {
   local max_time="${1:-10}"
-  /usr/bin/curl --socks5 127.0.0.1:1080 \
-    --resolve "jw.hitsz.edu.cn:443:${HITSZ_JW_REAL_IP}" \
+  /usr/bin/curl --socks5 "${SITE_SOCKS_HOST}:${SITE_SOCKS_PORT}" \
+    --resolve "${SITE_HEALTH_HOST}:443:${SITE_HEALTH_REAL_IP}" \
     --connect-timeout 4 --max-time "${max_time}" --insecure --silent --show-error \
-    --output /dev/null "${HITSZ_JW_URL}"
+    --output /dev/null "${SITE_HEALTH_URL}"
 }
 
 hitsz_repair_dante_dns() {
@@ -100,93 +103,15 @@ hitsz_wait_until_ready() {
   return 1
 }
 
-hitsz_retest_group() {
-  "${SURGE_CLI}" test-group "${HITSZ_GROUP}"
-}
-
-hitsz_set_atrust_route() {
-  "${SURGE_CLI}" --raw set \
-    "ProxyGroupSelection.${HITSZ_GROUP}=HITSZ-aTrust" \
-    "AutoPolicyGroupOverride.${HITSZ_GROUP}=<nil>" >/dev/null
-}
-
-hitsz_set_direct_route() {
-  "${SURGE_CLI}" --raw set \
-    "ProxyGroupSelection.${HITSZ_GROUP}=DIRECT" \
-    "AutoPolicyGroupOverride.${HITSZ_GROUP}=<nil>" >/dev/null
-}
-
-hitsz_normal_jw_probe() {
-  local code
-  code="$(hitsz_normal_jw_code 12)" || return 1
-  printf 'JW HTTP %s\n' "${code}"
-}
-
-hitsz_normal_jw_code() {
-  local max_time="${1:-5}"
-  env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
-    -u http_proxy -u https_proxy -u all_proxy \
-    /usr/bin/curl --connect-timeout 3 --max-time "${max_time}" --insecure \
-      --silent --show-error --output /dev/null --write-out '%{http_code}' \
-      "${HITSZ_JW_URL}"
-}
-
-hitsz_wait_for_stable_route() {
-  local required_seconds="${HITSZ_ROUTE_STABLE_SECONDS:-30}"
-  local timeout_seconds="${HITSZ_ROUTE_STABLE_TIMEOUT_SECONDS:-75}"
-  local interval_seconds="${HITSZ_ROUTE_STABLE_INTERVAL_SECONDS:-2}"
-  local elapsed=0 stable=0 code
-
-  printf 'Verifying %ss of continuous aTrust route health...\n' \
-    "${required_seconds}"
-  while [[ "${elapsed}" -lt "${timeout_seconds}" ]]; do
-    sleep "${interval_seconds}"
-    elapsed=$((elapsed + interval_seconds))
-    if hitsz_vpn_ready; then
-      stable=$((stable + interval_seconds))
-    else
-      stable=0
-    fi
-
-    if [[ "${stable}" -ge "${required_seconds}" ]]; then
-      code="$(hitsz_normal_jw_code 8 2>/dev/null || true)"
-      if [[ "${code}" =~ ^[0-9]{3}$ && "${code}" != "000" ]]; then
-        return 0
-      fi
-      stable=0
-    fi
-  done
-
-  printf 'aTrust route did not remain healthy for %ss within the %ss deadline.\n' \
-    "${required_seconds}" "${timeout_seconds}" >&2
-  return 1
-}
-
-hitsz_surge_environment() {
-  "${SURGE_CLI}" --raw environment 2>/dev/null
-}
-
-hitsz_current_selection() {
-  local selection
-  selection="$(hitsz_surge_environment | jq -er \
-    --arg group "${HITSZ_GROUP}" \
-    '.environment.ProxyGroupSelection[$group] // "UNKNOWN"' 2>/dev/null)" || selection="UNKNOWN"
-  printf '%s\n' "${selection}"
-}
-
-hitsz_restore_direct_route() {
-  local selection
-  if ! hitsz_set_direct_route; then
-    printf 'Failed to request the Surge HITSZ DIRECT policy.\n' >&2
-    return 1
-  fi
-  selection="$(hitsz_current_selection)"
-  if [[ "${selection}" != "DIRECT" ]]; then
-    printf 'Surge HITSZ rollback was not verified; live selection is %s.\n' \
-      "${selection}" >&2
-    return 1
-  fi
-}
+hitsz_retest_group() { bridge_surge_retest_group; }
+hitsz_set_atrust_route() { bridge_surge_select_backend; }
+hitsz_set_direct_route() { bridge_surge_select_direct; }
+hitsz_normal_jw_probe() { bridge_site_http_probe; }
+hitsz_normal_jw_code() { bridge_site_http_code "$@"; }
+hitsz_wait_for_stable_route() { bridge_wait_for_stable_route; }
+hitsz_surge_environment() { bridge_surge_environment; }
+hitsz_current_selection() { bridge_surge_current_selection; }
+hitsz_restore_direct_route() { bridge_surge_restore_direct; }
 
 hitsz_mode_connect() {
   ensure_bridge_preflight || return 1
@@ -208,51 +133,33 @@ hitsz_mode_start() {
   "${ROOT_DIR}/bin/up" --no-open
 }
 
-hitsz_mode_activate_route() {
-  if ! hitsz_vpn_ready; then
-    if ! hitsz_wait_until_ready 0; then
-      hitsz_restore_direct_route || true
-      return 1
-    fi
-  fi
-  if ! hitsz_wait_for_socks_path; then
-    hitsz_restore_direct_route || true
-    printf 'The aTrust tunnel is ready, but the JW SOCKS path did not become usable.\n' >&2
-    return 1
-  fi
-  if ! hitsz_set_atrust_route; then
-    hitsz_restore_direct_route || true
-    printf 'Failed to select the Surge HITSZ-aTrust policy.\n' >&2
-    return 1
-  fi
-  if ! hitsz_normal_jw_probe; then
-    hitsz_restore_direct_route || true
-    printf 'aTrust SOCKS is ready, but the Surge HITSZ route still failed.\n' >&2
-    return 1
-  fi
-  printf 'HITSZ network is available; completing stability checks...\n'
+bridge_backend_ready() {
+  hitsz_vpn_ready
 }
 
-hitsz_mode_settle() {
-  if ! hitsz_wait_for_stable_route; then
-    hitsz_restore_direct_route || true
-    return 1
+bridge_backend_wait_ready() {
+  hitsz_wait_until_ready "$@"
+}
+
+bridge_backend_prepare_proxy() {
+  if hitsz_wait_for_socks_path; then
+    return 0
   fi
+  printf 'The %s tunnel is ready, but the %s SOCKS path did not become usable.\n' \
+    "${SITE_BACKEND_LABEL}" "${SITE_HEALTH_LABEL}" >&2
+  return 1
+}
+
+bridge_backend_cleanup() {
   if ! stop_login_browser; then
     printf 'WARNING: failed to stop login Chromium; run bin/trim-browser.\n' >&2
     return 1
   fi
   printf 'Login Chromium stopped to release VM memory.\n'
-  if ! hitsz_normal_jw_probe; then
-    if hitsz_restore_direct_route; then
-      printf 'The aTrust route failed after browser shutdown; reverted HITSZ to DIRECT.\n' >&2
-    else
-      printf 'The aTrust route failed after browser shutdown; DIRECT rollback was not verified.\n' >&2
-    fi
-    return 1
-  fi
-  printf 'HITSZ outside mode is ready; Surge is pinned to aTrust until hitsz down.\n'
 }
+
+hitsz_mode_activate_route() { bridge_surge_activate; }
+hitsz_mode_settle() { bridge_surge_settle; }
 
 hitsz_mode_finish() {
   hitsz_mode_activate_route || return 1

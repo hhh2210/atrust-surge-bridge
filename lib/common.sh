@@ -16,6 +16,10 @@ die() {
   exit 1
 }
 
+# shellcheck source=site_profile.sh
+source "${ROOT_DIR}/lib/site_profile.sh"
+load_site_profile
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }

@@ -35,18 +35,18 @@ mock_running_container() {
 }
 
 test_selection_from_environment() (
-  hitsz_surge_environment() {
+  bridge_surge_environment() {
     printf '%s\n' '{"environment":{"ProxyGroupSelection":{"HITSZ":"HITSZ-aTrust"}}}'
   }
   assert_eq 'HITSZ-aTrust' "$(hitsz_current_selection)" 'live selection'
 
-  hitsz_surge_environment() { printf '%s\n' '{"environment":{}}'; }
+  bridge_surge_environment() { printf '%s\n' '{"environment":{}}'; }
   assert_eq 'UNKNOWN' "$(hitsz_current_selection)" 'missing selection'
 
-  hitsz_surge_environment() { printf '%s\n' 'not-json'; }
+  bridge_surge_environment() { printf '%s\n' 'not-json'; }
   assert_eq 'UNKNOWN' "$(hitsz_current_selection)" 'invalid environment JSON'
 
-  hitsz_surge_environment() { return 1; }
+  bridge_surge_environment() { return 1; }
   assert_eq 'UNKNOWN' "$(hitsz_current_selection)" 'environment command failure'
 )
 
@@ -277,15 +277,15 @@ test_preflight_stops_at_first_failure() (
 
 test_route_stability_requires_consecutive_health() (
   local checks=0
-  HITSZ_ROUTE_STABLE_SECONDS=6
-  HITSZ_ROUTE_STABLE_TIMEOUT_SECONDS=12
-  HITSZ_ROUTE_STABLE_INTERVAL_SECONDS=2
+  BRIDGE_ROUTE_STABLE_SECONDS=6
+  BRIDGE_ROUTE_STABLE_TIMEOUT_SECONDS=12
+  BRIDGE_ROUTE_STABLE_INTERVAL_SECONDS=2
   sleep() { :; }
   hitsz_vpn_ready() {
     checks=$((checks + 1))
     [[ "${checks}" -ne 2 ]]
   }
-  hitsz_normal_jw_code() { printf '200\n'; }
+  bridge_site_http_code() { printf '200\n'; }
 
   hitsz_wait_for_stable_route >/dev/null
   assert_eq '5' "${checks}" 'consecutive stability checks'
@@ -312,9 +312,10 @@ test_activate_route_stops_at_usability_boundary() (
 
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
   hitsz_repair_dante_dns() { printf 'repair\n' >>"${trace}"; }
-  hitsz_set_atrust_route() { printf 'route\n' >>"${trace}"; }
-  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 0; }
-  hitsz_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
+  bridge_surge_select_backend() { printf 'route\n' >>"${trace}"; }
+  bridge_surge_current_selection() { printf '%s\n' "${SITE_SURGE_BACKEND_POLICY}"; }
+  bridge_site_http_probe() { printf 'probe\n' >>"${trace}"; return 0; }
+  bridge_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
   stop_login_browser() { printf 'trim\n' >>"${trace}"; return 0; }
 
   hitsz_mode_activate_route >/dev/null
@@ -324,8 +325,8 @@ test_activate_route_stops_at_usability_boundary() (
 
 test_restore_direct_verifies_live_selection() (
   local mock_selection='HITSZ-aTrust'
-  hitsz_set_direct_route() { return 0; }
-  hitsz_current_selection() { printf '%s\n' "${mock_selection}"; }
+  bridge_surge_select_direct() { return 0; }
+  bridge_surge_current_selection() { printf '%s\n' "${mock_selection}"; }
 
   if hitsz_restore_direct_route >/dev/null 2>&1; then
     fail 'DIRECT rollback must fail when the live selection disagrees'
@@ -341,9 +342,9 @@ test_route_selection_failure_rolls_back() (
 
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
   hitsz_wait_for_socks_path() { printf 'socks\n' >>"${trace}"; return 0; }
-  hitsz_set_atrust_route() { printf 'route-failed\n' >>"${trace}"; return 1; }
-  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; return 0; }
-  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 0; }
+  bridge_surge_select_backend() { printf 'route-failed\n' >>"${trace}"; return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; return 0; }
+  bridge_site_http_probe() { printf 'probe\n' >>"${trace}"; return 0; }
 
   if hitsz_mode_activate_route >/dev/null 2>&1; then
     fail 'failed HITSZ-aTrust selection must fail activation'
@@ -359,7 +360,7 @@ test_tunnel_readiness_failure_rolls_back() (
 
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 1; }
   hitsz_wait_until_ready() { printf 'wait:%s\n' "$1" >>"${trace}"; return 1; }
-  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; return 0; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; return 0; }
   hitsz_wait_for_socks_path() { printf 'socks\n' >>"${trace}"; return 0; }
 
   if hitsz_mode_activate_route >/dev/null 2>&1; then
@@ -374,9 +375,9 @@ test_down_requires_verified_direct() (
   trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
   trap 'rm -f "${trace}"' EXIT
 
-  hitsz_restore_direct_route() { printf 'direct-failed\n' >>"${trace}"; return 1; }
+  bridge_surge_restore_direct() { printf 'direct-failed\n' >>"${trace}"; return 1; }
   hitsz_retest_group() { printf 'retest\n' >>"${trace}"; }
-  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; }
+  bridge_site_http_probe() { printf 'probe\n' >>"${trace}"; }
 
   if hitsz_mode_down >/dev/null 2>&1; then
     fail 'down must fail closed when DIRECT cannot be verified'
@@ -391,9 +392,10 @@ test_finish_trims_after_success() (
 
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
   hitsz_repair_dante_dns() { printf 'repair\n' >>"${trace}"; }
-  hitsz_set_atrust_route() { printf 'route\n' >>"${trace}"; }
-  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 0; }
-  hitsz_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
+  bridge_surge_select_backend() { printf 'route\n' >>"${trace}"; }
+  bridge_surge_current_selection() { printf '%s\n' "${SITE_SURGE_BACKEND_POLICY}"; }
+  bridge_site_http_probe() { printf 'probe\n' >>"${trace}"; return 0; }
+  bridge_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
   stop_login_browser() { printf 'trim\n' >>"${trace}"; return 0; }
 
   hitsz_mode_finish >/dev/null
@@ -408,10 +410,11 @@ test_unstable_finish_reverts_direct_without_trim() (
 
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
   hitsz_repair_dante_dns() { printf 'repair\n' >>"${trace}"; }
-  hitsz_set_atrust_route() { printf 'route\n' >>"${trace}"; }
-  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 0; }
-  hitsz_wait_for_stable_route() { printf 'unstable\n' >>"${trace}"; return 1; }
-  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; }
+  bridge_surge_select_backend() { printf 'route\n' >>"${trace}"; }
+  bridge_surge_current_selection() { printf '%s\n' "${SITE_SURGE_BACKEND_POLICY}"; }
+  bridge_site_http_probe() { printf 'probe\n' >>"${trace}"; return 0; }
+  bridge_wait_for_stable_route() { printf 'unstable\n' >>"${trace}"; return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
   stop_login_browser() { printf 'trim\n' >>"${trace}"; return 0; }
 
   if hitsz_mode_finish >/dev/null 2>&1; then
@@ -428,9 +431,10 @@ test_browser_stop_failure_is_visible() (
 
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
   hitsz_repair_dante_dns() { printf 'repair\n' >>"${trace}"; }
-  hitsz_set_atrust_route() { printf 'route\n' >>"${trace}"; }
-  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 0; }
-  hitsz_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
+  bridge_surge_select_backend() { printf 'route\n' >>"${trace}"; }
+  bridge_surge_current_selection() { printf '%s\n' "${SITE_SURGE_BACKEND_POLICY}"; }
+  bridge_site_http_probe() { printf 'probe\n' >>"${trace}"; return 0; }
+  bridge_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
   stop_login_browser() { printf 'trim-failed\n' >>"${trace}"; return 1; }
 
   if hitsz_mode_finish >/dev/null 2>&1; then
@@ -447,15 +451,16 @@ test_post_stop_probe_failure_reverts_direct() (
 
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
   hitsz_repair_dante_dns() { printf 'repair\n' >>"${trace}"; }
-  hitsz_set_atrust_route() { printf 'route\n' >>"${trace}"; }
-  hitsz_normal_jw_probe() {
+  bridge_surge_select_backend() { printf 'route\n' >>"${trace}"; }
+  bridge_surge_current_selection() { printf '%s\n' "${SITE_SURGE_BACKEND_POLICY}"; }
+  bridge_site_http_probe() {
     probes=$((probes + 1))
     printf 'probe:%s\n' "${probes}" >>"${trace}"
     [[ "${probes}" -eq 1 ]]
   }
-  hitsz_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
+  bridge_wait_for_stable_route() { printf 'stable\n' >>"${trace}"; return 0; }
   stop_login_browser() { printf 'trim\n' >>"${trace}"; return 0; }
-  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
 
   if hitsz_mode_finish >/dev/null 2>&1; then
     fail 'post-stop probe failure must fail finish'
@@ -471,9 +476,10 @@ test_failed_finish_does_not_trim() (
 
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 0; }
   hitsz_repair_dante_dns() { printf 'repair\n' >>"${trace}"; }
-  hitsz_set_atrust_route() { printf 'route\n' >>"${trace}"; }
-  hitsz_normal_jw_probe() { printf 'probe\n' >>"${trace}"; return 1; }
-  hitsz_restore_direct_route() { printf 'direct\n' >>"${trace}"; }
+  bridge_surge_select_backend() { printf 'route\n' >>"${trace}"; }
+  bridge_surge_current_selection() { printf '%s\n' "${SITE_SURGE_BACKEND_POLICY}"; }
+  bridge_site_http_probe() { printf 'probe\n' >>"${trace}"; return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
   stop_login_browser() { printf 'trim\n' >>"${trace}"; return 0; }
 
   if hitsz_mode_finish >/dev/null 2>&1; then

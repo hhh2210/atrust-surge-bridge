@@ -20,7 +20,8 @@ hitsz_ui_plain_status() {
   fi
   printf 'Docker: %s%s\n' "${HITSZ_STATUS_DOCKER}" "${HITSZ_STATUS_USAGE:+ (${HITSZ_STATUS_USAGE})}"
   printf 'VPN: %s\n' "${HITSZ_STATUS_VPN}"
-  printf 'SOCKS: 127.0.0.1:1080 %s\n' "${HITSZ_STATUS_SOCKS}"
+  printf 'SOCKS: %s:%s %s\n' \
+    "${SITE_SOCKS_HOST}" "${SITE_SOCKS_PORT}" "${HITSZ_STATUS_SOCKS}"
 }
 
 hitsz_ui_render_status() {
@@ -55,7 +56,8 @@ hitsz_ui_render_status() {
   fi
   docker_value="$(gum style --foreground "${docker_color}" "${HITSZ_STATUS_DOCKER}${HITSZ_STATUS_USAGE:+ · ${HITSZ_STATUS_USAGE}}")"
   vpn_value="$(gum style --foreground "${vpn_color}" "${HITSZ_STATUS_VPN}")"
-  socks_value="$(gum style --foreground "${docker_color}" "127.0.0.1:1080 · ${HITSZ_STATUS_SOCKS}")"
+  socks_value="$(gum style --foreground "${docker_color}" \
+    "${SITE_SOCKS_HOST}:${SITE_SOCKS_PORT} · ${HITSZ_STATUS_SOCKS}")"
 
   content="$(
     printf '%s\n%s\n\n' "${title}" "${mode}"
