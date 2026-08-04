@@ -1,5 +1,5 @@
 #!/bin/bash
-# shellcheck disable=SC2329 # Mock functions are called indirectly by sourced code.
+# shellcheck disable=SC2317,SC2329 # Mock functions are called indirectly by sourced code.
 set -euo pipefail
 
 TEST_ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
