@@ -76,13 +76,15 @@ hitsz_wait_until_ready() {
   local auto_open="${1:-1}"
   local max_seconds="${HITSZ_LOGIN_WAIT_SECONDS:-180}"
   local grace_seconds="${HITSZ_TRUSTED_LOGIN_GRACE_SECONDS:-30}"
+  local reveal_checks="${HITSZ_CAS_FORM_REVEAL_CHECKS:-2}"
   local attempts=$((max_seconds / 2))
   local open_attempt=$(((grace_seconds + 1) / 2))
-  local opened=0 i
+  local opened=0 form_checks=0 i
 
   [[ "${open_attempt}" -ge 1 ]] || open_attempt=1
+  [[ "${reveal_checks}" =~ ^[1-9][0-9]*$ ]] || reveal_checks=2
   if [[ "${auto_open}" -eq 1 ]]; then
-    printf 'Waiting up to %ss for trusted-terminal renewal before showing noVNC...\n' \
+    printf 'Waiting for trusted-terminal renewal; noVNC opens once the CAS form needs input (at most %ss)...\n' \
       "${grace_seconds}"
   fi
 
@@ -91,10 +93,21 @@ hitsz_wait_until_ready() {
       return 0
     fi
 
-    if [[ "${auto_open}" -eq 1 && "${i}" -eq "${open_attempt}" && "${opened}" -eq 0 ]]; then
-      printf 'Trusted-terminal renewal needs attention; opening loopback-only noVNC...\n'
-      hitsz_open_login
-      opened=1
+    if [[ "${auto_open}" -eq 1 && "${opened}" -eq 0 ]]; then
+      if cas_login_form_visible; then
+        form_checks=$((form_checks + 1))
+      else
+        form_checks=0
+      fi
+      if [[ "${form_checks}" -ge "${reveal_checks}" ]]; then
+        printf 'The CAS login form is waiting for input; opening loopback-only noVNC...\n'
+        hitsz_open_login
+        opened=1
+      elif [[ "${i}" -ge "${open_attempt}" ]]; then
+        printf 'Trusted-terminal renewal needs attention; opening loopback-only noVNC...\n'
+        hitsz_open_login
+        opened=1
+      fi
     fi
     sleep 2
   done
@@ -158,17 +171,55 @@ bridge_backend_cleanup() {
   printf 'Login Chromium stopped to release VM memory.\n'
 }
 
-hitsz_mode_activate_route() { bridge_surge_activate; }
-hitsz_mode_settle() { bridge_surge_settle; }
+# A newer activation supersedes any background settle before touching Surge.
+# The interactive UI claims in its own process (activation runs in a gum child)
+# and passes BRIDGE_SETTLE_TOKEN down; otherwise claim here.
+hitsz_mode_activate_route() {
+  if [[ -z "${BRIDGE_SETTLE_TOKEN:-}" ]]; then
+    bridge_settle_claim || return 1
+  fi
+  bridge_surge_activate "${BRIDGE_SETTLE_TOKEN}"
+}
+# Foreground settles (plain mode, __core_settle, HITSZ_SETTLE_FOREGROUND=1)
+# carry the claimed token too, so a newer activation still supersedes them.
+hitsz_mode_settle() { bridge_surge_settle "${BRIDGE_SETTLE_TOKEN:-}"; }
+hitsz_mode_settle_bg() { bridge_settle_run_bg "$@"; }
+
+hitsz_settle_dispatch() {
+  bridge_settle_dispatch "${ROOT_DIR}/bin/hitsz"
+}
 
 hitsz_mode_finish() {
   hitsz_mode_activate_route || return 1
   hitsz_mode_settle
 }
 
+hitsz_mode_finish_dispatch() {
+  hitsz_mode_activate_route || return 1
+  hitsz_settle_dispatch
+}
+
 hitsz_mode_up() {
-  hitsz_mode_connect || return 1
-  hitsz_mode_finish
+  # Claim before the login flow can open a browser an old settle might close.
+  if [[ -z "${BRIDGE_SETTLE_TOKEN:-}" ]]; then
+    bridge_settle_claim || return 1
+  fi
+  if ! hitsz_mode_connect; then
+    hitsz_mode_connect_failed
+    return 1
+  fi
+  hitsz_mode_finish_dispatch
+}
+
+# The claim stopped any pending settle, which owned the DIRECT rollback for an
+# unhealthy tunnel. A failed connect must not leave Surge on a backend nobody
+# monitors, so fall back to DIRECT under this run's token. A settle is not
+# re-armed instead: its cleanup would close a login the user may still finish.
+hitsz_mode_connect_failed() {
+  [[ "$(hitsz_current_selection)" == "${SITE_SURGE_BACKEND_POLICY}" ]] || return 0
+  printf 'Connection setup failed; returning Surge %s to %s.\n' \
+    "${SITE_SURGE_GROUP}" "${SITE_SURGE_DIRECT_POLICY}" >&2
+  bridge_activation_rollback "${BRIDGE_SETTLE_TOKEN:-}"
 }
 
 hitsz_open_login() {
@@ -183,12 +234,40 @@ hitsz_open_login() {
   open "$(novnc_autologin_url)"
 }
 
+hitsz_mode_down_superseded() {
+  printf 'A newer hitsz command took over the route; leaving the bridge running.\n' >&2
+}
+
 hitsz_mode_down() {
-  if ! hitsz_restore_direct_route; then
+  local rc=0
+  # The lock also guards an in-flight activation's backend selection; without
+  # the claim it could select the backend after our DIRECT write and leave
+  # Surge on a tunnel we are about to stop.
+  if ! bridge_settle_claim; then
+    printf 'Refusing to stop the bridge while another hitsz command owns the Surge route.\n' >&2
+    return 1
+  fi
+  # Keep ownership through the shutdown: both steps run under the lock and only
+  # while this generation is current, so a newer `up` either waits for the VM
+  # to stop or makes this `down` back off before it stops a live tunnel.
+  bridge_settle_exclusive "${BRIDGE_SETTLE_TOKEN}" hitsz_restore_direct_route || rc=$?
+  if [[ "${rc}" -eq 3 ]]; then
+    hitsz_mode_down_superseded
+    return 1
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
     printf 'Refusing to stop the bridge because HITSZ=DIRECT was not verified.\n' >&2
     return 1
   fi
-  "${ROOT_DIR}/bin/down"
+  bridge_settle_exclusive "${BRIDGE_SETTLE_TOKEN}" "${ROOT_DIR}/bin/down" || rc=$?
+  if [[ "${rc}" -eq 3 ]]; then
+    hitsz_mode_down_superseded
+    return 1
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
+    printf 'Stopping the bridge failed; the container or Colima VM may still be running.\n' >&2
+    return "${rc}"
+  fi
   hitsz_retest_group || true
   if hitsz_normal_jw_probe; then
     printf 'HITSZ direct access is available on the current network.\n'

@@ -131,14 +131,30 @@ route, verifies a real JW request, and stops the login-only Chromium process to
 release VM memory. `hitsz down` removes the container and stops the VM while
 preserving all three login-state volumes.
 
-In an interactive terminal, `hitsz up` renders those operations as three
-synchronous phases: restore the isolated tunnel, activate the Surge route and
-pass the first JW request, then observe 30 seconds of continuous health and
-release Chromium. A green `网络已可用` milestone appears immediately after the
-first JW request succeeds. The final phase remains foreground work so a route
-regression or browser-cleanup failure still produces a visible nonzero result.
+`hitsz up` restores the isolated tunnel, activates the Surge route, and passes
+the first JW request in the foreground; a green `网络已可用` milestone appears
+as soon as that request succeeds and the command returns. The 30-second health
+window and Chromium cleanup then continue in the background
+(`~/.local/state/atrust-surge-bridge/hitsz/settle.log`, override with `BRIDGE_STATE_DIR` or `HITSZ_STATE_DIR`): a route
+regression still rolls Surge back to a verified `DIRECT`, and `hitsz status`
+shows `Settle` while the check runs, after it failed, or when it was
+interrupted before recording a result (for example by a restart). Each
+background check carries a generation token, and any later activation or
+`hitsz down` cancels it first, so a stale check can never revert a newer
+connection. Route changes are serialized by a kernel `flock` on
+`settle.lock` (taken through the system `perl`, since macOS has no `flock(1)`),
+so a crashed command never leaves a stale lock behind. `hitsz down` refuses to
+stop the bridge while another `hitsz` command still holds the route, keeps it
+until the VM has stopped, and an `up` whose connection setup fails returns
+a `HITSZ-aTrust` selection to `DIRECT` instead of leaving it unchecked. Set
+`HITSZ_SETTLE_FOREGROUND=1` to keep the old blocking behaviour.
 If the bridge container is already running, `hitsz up` reuses it instead of
-rebuilding the image or recreating the container. This keeps a healthy aTrust
+rebuilding the image or recreating the container. On a cold start the image is
+rebuilt only when a SHA-256 of the build context (Dockerfile, `container/`,
+`patches/`, and the pinned base digest) differs from the label on the local
+image; a cached buildx run would otherwise still spend about three seconds
+resolving the base image against the registry. `HITSZ_FORCE_BUILD=1` forces
+a rebuild. This keeps a healthy aTrust
 session stable when the command is repeated. Route activation allows up to 30
 seconds for the real JW SOCKS path to become usable; on failure it requests
 `DIRECT`, verifies the live Surge selection, and reports an error if that
@@ -147,8 +163,12 @@ fresh authentication is required. After pulling a revision that changes the
 Docker image or container scripts, run `hitsz down` once before the next
 `hitsz up` so the new image is built and deployed.
 
-On startup, `hitsz up` first gives the trusted-terminal flow 30 seconds to
-renew silently. For the pinned aTrust 2.5.16.20 client, it uses a fail-closed
+On startup, `hitsz up` first gives the trusted-terminal flow up to 30 seconds
+to renew silently. A valid CAS SSO session passes the CAS login page within the
+same second, so when the in-container Chromium window still shows the CAS login
+form on two consecutive readiness checks (about 2–4 seconds), `hitsz up` opens
+noVNC immediately instead of waiting out the full grace period
+(`HITSZ_CAS_FORM_REVEAL_CHECKS`, `ATRUST_CAS_LOGIN_TITLE_RE`). For the pinned aTrust 2.5.16.20 client, it uses a fail-closed
 GUI guard: the client window must be uniquely visible, owned by the expected
 `aTrustTray` process, match the expected geometry, and show `Log In` in an OCR
 crop before one coordinate click is sent. The click only launches the isolated
@@ -177,9 +197,10 @@ If the trusted-device grant itself expires, the browser remains open for manual
 SSO; once automatic retries are latched, `hitsz status` reports `需手动登录`.
 On the exact HITSZ CAS login origin,
 a bundled extension first verifies that the CAS `service` target is the HITSZ
-aTrust callback, then waits for Chromium's native password autofill, opts into
-the form's seven-day `rememberMe` session, and clicks the exact scoped submit
-control once. The extension never reads field values and has no network
+aTrust callback and pre-selects the form's seven-day `rememberMe` session once,
+so a manual noVNC login also lets the next relaunch within seven days pass CAS
+SSO without a form. It then waits for Chromium's native password autofill and
+clicks the exact scoped submit control once. The extension never reads field values and has no network
 permissions. Project code never receives or writes the school password, but if
 you enable Chromium's password manager, its saved-password database is part of
 the persistent `atrust-surge-data` browser profile. Treat that volume as

@@ -1,5 +1,5 @@
 #!/bin/bash
-# shellcheck disable=SC2317,SC2329 # Mock functions are called indirectly by sourced code.
+# shellcheck disable=SC2317,SC2329,SC2030,SC2031 # Mocks are called indirectly; each test is an isolated subshell.
 set -euo pipefail
 
 TEST_ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -10,11 +10,17 @@ source "${TEST_ROOT}/lib/common.sh"
 source "${TEST_ROOT}/lib/surge_mode.sh"
 # shellcheck source=../lib/status.sh
 source "${TEST_ROOT}/lib/status.sh"
+# shellcheck source=../lib/ui.sh
+source "${TEST_ROOT}/lib/ui.sh"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
 }
+
+HITSZ_STATE_DIR="$(mktemp -d -t hitsz-test-state.XXXXXX)"
+export HITSZ_STATE_DIR
+trap 'rm -rf "${HITSZ_STATE_DIR}"' EXIT
 
 assert_eq() {
   local expected="$1" actual="$2" label="$3"
@@ -189,6 +195,7 @@ test_trusted_renewal_avoids_novnc() (
     [[ "${checks}" -ge 2 ]]
   }
   hitsz_open_login() { : >"${marker}"; }
+  cas_login_form_visible() { return 1; }
   sleep() { :; }
 
   hitsz_wait_until_ready 1 >/dev/null
@@ -205,10 +212,54 @@ test_novnc_opens_after_grace() (
     [[ "${checks}" -ge 4 ]]
   }
   hitsz_open_login() { opened_at="${checks}"; }
+  cas_login_form_visible() { return 1; }
   sleep() { :; }
 
   hitsz_wait_until_ready 1 >/dev/null
   assert_eq '2' "${opened_at}" 'noVNC grace attempt'
+)
+
+test_novnc_opens_early_on_waiting_cas_form() (
+  local checks=0 opened_at=0 opens=0
+
+  HITSZ_TRUSTED_LOGIN_GRACE_SECONDS=30
+  HITSZ_LOGIN_WAIT_SECONDS=60
+  hitsz_vpn_ready() {
+    checks=$((checks + 1))
+    [[ "${checks}" -ge 10 ]]
+  }
+  # The form appears on the third check and stays until a human submits it.
+  cas_login_form_visible() { [[ "${checks}" -ge 3 ]]; }
+  hitsz_open_login() {
+    opens=$((opens + 1))
+    opened_at="${checks}"
+  }
+  sleep() { :; }
+
+  hitsz_wait_until_ready 1 >/dev/null
+  assert_eq '4' "${opened_at}" 'early noVNC reveal check'
+  assert_eq '1' "${opens}" 'noVNC opens once'
+)
+
+test_transient_cas_form_does_not_open_novnc() (
+  local checks=0 marker
+  marker="$(mktemp -t hitsz-test-novnc.XXXXXX)"
+  rm -f "${marker}"
+  trap 'rm -f "${marker}"' EXIT
+
+  HITSZ_TRUSTED_LOGIN_GRACE_SECONDS=30
+  HITSZ_LOGIN_WAIT_SECONDS=60
+  hitsz_vpn_ready() {
+    checks=$((checks + 1))
+    [[ "${checks}" -ge 4 ]]
+  }
+  # CAS SSO redirects away from the form before a second check sees it.
+  cas_login_form_visible() { [[ "${checks}" -eq 2 ]]; }
+  hitsz_open_login() { : >"${marker}"; }
+  sleep() { :; }
+
+  hitsz_wait_until_ready 1 >/dev/null
+  [[ ! -e "${marker}" ]] || fail 'a CAS SSO pass-through must not open noVNC'
 )
 
 test_mode_up_triggers_client_login() (
@@ -222,10 +273,10 @@ test_mode_up_triggers_client_login() (
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 1; }
   trigger_atrust_login() { printf 'trigger\n' >>"${trace}"; }
   hitsz_wait_until_ready() { printf 'wait:%s\n' "$1" >>"${trace}"; }
-  hitsz_mode_finish() { printf 'finish\n' >>"${trace}"; }
+  hitsz_mode_finish_dispatch() { printf 'finish-dispatch\n' >>"${trace}"; }
 
   hitsz_mode_up >/dev/null
-  expected=$'preflight\nstart\nvpn\ntrigger\nwait:1\nfinish'
+  expected=$'preflight\nstart\nvpn\ntrigger\nwait:1\nfinish-dispatch'
   assert_eq "${expected}" "$(cat "${trace}")" 'mode up login trigger order'
 )
 
@@ -489,6 +540,420 @@ test_failed_finish_does_not_trim() (
   assert_eq "${expected}" "$(cat "${trace}")" 'failed finish order'
 )
 
+test_background_settle_dispatch_records_generation() (
+  local trace launched
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  nohup() { printf '%s\n' "$*" >"${trace}"; }
+  bridge_surge_settle() { fail 'background dispatch must not settle in the foreground'; }
+
+  bridge_settle_claim
+  hitsz_settle_dispatch >/dev/null
+  wait
+  launched="$(cat "${trace}")"
+  [[ "${launched}" == *"/bin/hitsz __core_settle_bg $(cat "${HITSZ_STATE_DIR}/settle.generation")" ]] ||
+    fail "unexpected background settle command: ${launched}"
+  assert_eq 'running' "$(cut -d' ' -f1 "${HITSZ_STATE_DIR}/settle.state")" 'dispatch state'
+)
+
+test_foreground_settle_env_keeps_blocking_path() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  export HITSZ_SETTLE_FOREGROUND=1
+  nohup() { fail 'foreground settle must not launch a background job'; }
+  bridge_surge_settle() { printf 'settle:%s\n' "${1:-}" >>"${trace}"; }
+
+  hitsz_settle_dispatch
+  assert_eq 'settle:' "$(cat "${trace}")" 'foreground settle call'
+)
+
+test_superseded_settle_never_rolls_back() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  printf 'newer-generation\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  bridge_wait_for_stable_route() { return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+  bridge_backend_cleanup() { printf 'trim\n' >>"${trace}"; }
+
+  hitsz_mode_settle_bg 'old-generation' || fail 'superseded settle must exit quietly'
+  assert_eq '' "$(cat "${trace}")" 'superseded settle side effects'
+)
+
+test_current_settle_failure_rolls_back_and_records() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  bridge_wait_for_stable_route() { return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+
+  if hitsz_mode_settle_bg 'gen-1' >/dev/null 2>&1; then
+    fail 'an unstable current settle must fail'
+  fi
+  assert_eq 'direct' "$(cat "${trace}")" 'current settle rollback'
+  assert_eq 'failed' "$(cut -d' ' -f1 "${HITSZ_STATE_DIR}/settle.state")" 'failed settle state'
+)
+
+test_activation_cancels_previous_settle() (
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  bridge_surge_activate() { return 0; }
+
+  hitsz_mode_activate_route >/dev/null
+  bridge_settle_superseded 'gen-1' || fail 'a new activation must supersede the old settle'
+)
+
+test_status_reports_failed_settle() (
+  printf 'failed 0\n' >"${HITSZ_STATE_DIR}/settle.state"
+  rm -f "${HITSZ_STATE_DIR}/settle.pid"
+  docker_ctx() { return 1; }
+  nc() { return 1; }
+  hitsz_current_selection() { printf 'DIRECT\n'; }
+  hitsz_status_jw_code() { printf '000\n'; }
+
+  hitsz_collect_status
+  assert_eq 'FAILED' "${HITSZ_STATUS_SETTLE}" 'failed settle status'
+)
+
+test_ui_renders_settle_row() (
+  local output
+  hitsz_ui_enabled() { return 0; }
+  # Echo the last argument so rendered rows stay visible without gum.
+  gum() { local last; for last in "$@"; do :; done; printf '%s\n' "${last}"; }
+  HITSZ_STATUS_MODE='校外 aTrust'
+  HITSZ_STATUS_JW_CODE='200'
+  HITSZ_STATUS_POLICY='HITSZ-aTrust'
+  HITSZ_STATUS_DOCKER='ON'
+  HITSZ_STATUS_USAGE=''
+  HITSZ_STATUS_VPN='CONNECTED'
+  HITSZ_STATUS_SOCKS='OPEN'
+  HITSZ_STATUS_SETTLE='RUNNING'
+
+  output="$(hitsz_ui_render_status 2>&1)"
+  [[ "${output}" == *'Settle'*'后台验收中'* ]] || fail "settle row missing: ${output}"
+  [[ "${output}" != *'syntax error'* ]] || fail "status UI failed to parse: ${output}"
+)
+
+test_cancel_waits_for_inflight_rollback() (
+  local trace bg
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  slow_rollback() {
+    command sleep 0.6
+    printf 'direct\n' >>"${trace}"
+  }
+  bridge_settle_exclusive 'gen-1' slow_rollback &
+  bg=$!
+  command sleep 0.2
+  # A new activation claims the route while the old rollback is in flight.
+  bridge_settle_claim
+  printf 'activate\n' >>"${trace}"
+  wait "${bg}" || true
+  assert_eq $'direct\nactivate' "$(cat "${trace}")" 'cancel waits for in-flight rollback'
+  ( BRIDGE_SETTLE_LOCK_WAIT_TICKS=1 bridge_settle_lock ) 2>/dev/null || fail 'settle lock must be released'
+)
+
+test_superseded_exclusive_skips_side_effect() (
+  local rc=0
+  printf 'cancelled\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  side_effect() { fail 'superseded token must not run its side effect'; }
+  bridge_settle_exclusive 'gen-1' side_effect || rc=$?
+  assert_eq '3' "${rc}" 'superseded exclusive status'
+)
+
+test_stale_settle_lock_is_reclaimed() (
+  # A lock file left by a crash or reboot holds no kernel lock.
+  printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock"
+  export BRIDGE_SETTLE_LOCK_WAIT_TICKS=5
+  bridge_settle_lock || fail 'a lock file without a live holder must not block'
+  bridge_settle_unlock
+)
+
+# Starts a background process that holds the settle lock; prints its PID.
+start_lock_holder() {
+  local ready="$1"
+  ( bridge_settle_lock && : >"${ready}" && exec sleep 30 ) >/dev/null 2>&1 &
+  printf '%s\n' "$!"
+}
+
+wait_for_file() {
+  local _
+  for _ in $(seq 1 50); do
+    [[ -e "$1" ]] && return 0
+    command sleep 0.1
+  done
+  fail "timed out waiting for $1"
+}
+
+test_cancel_timeout_blocks_new_activation() (
+  local holder trace ready
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  ready="${trace}.ready"
+  holder="$(start_lock_holder "${ready}")"
+  trap 'kill "${holder}" 2>/dev/null || true; rm -f "${trace}" "${ready}"' EXIT
+  wait_for_file "${ready}"
+
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  export BRIDGE_SETTLE_LOCK_WAIT_TICKS=2
+  bridge_surge_activate() { printf 'activate\n' >>"${trace}"; }
+
+  if hitsz_mode_activate_route >/dev/null 2>&1; then
+    fail 'activation must fail while an old side effect still holds the lock'
+  fi
+  assert_eq '' "$(cat "${trace}")" 'no activation behind a live settle lock'
+  assert_eq 'gen-1' "$(cat "${HITSZ_STATE_DIR}/settle.generation")" 'old generation kept'
+  kill "${holder}" 2>/dev/null
+  wait "${holder}" 2>/dev/null || true
+  ( bridge_settle_lock ) || fail 'the lock must free when its holder dies'
+)
+
+test_background_settle_does_not_inherit_lock() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+  # A detached child that kept fd 9 would hold the lock for its lifetime.
+  nohup() { command sleep 3 & printf '%s\n' "$!" >"${trace}"; }
+
+  bridge_settle_claim
+  hitsz_settle_dispatch >/dev/null
+  BRIDGE_SETTLE_LOCK_WAIT_TICKS=5 bridge_settle_lock ||
+    fail 'the background settle must not inherit the settle lock'
+  bridge_settle_unlock
+  kill "$(cat "${trace}")" 2>/dev/null || true
+)
+
+test_guarded_side_effect_does_not_inherit_lock() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  side_effect() { command sleep 3 & printf '%s\n' "$!" >"${trace}"; }
+
+  bridge_settle_exclusive 'gen-1' side_effect
+  BRIDGE_SETTLE_LOCK_WAIT_TICKS=5 bridge_settle_lock ||
+    fail 'a child of a guarded side effect must not inherit the settle lock'
+  bridge_settle_unlock
+  kill "$(cat "${trace}")" 2>/dev/null || true
+)
+
+test_late_dispatch_from_older_activation_backs_off() (
+  local trace token_a
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  nohup() {
+    local last
+    for last in "$@"; do :; done
+    printf 'launch:%s\n' "${last}" >>"${trace}"
+  }
+  # Two overlapping `hitsz up` runs: A claims, then B claims and dispatches,
+  # then A's dispatch arrives late.
+  bridge_settle_claim
+  token_a="${BRIDGE_SETTLE_TOKEN}"
+  bridge_settle_claim
+  hitsz_settle_dispatch >/dev/null
+  wait
+  BRIDGE_SETTLE_TOKEN="${token_a}" hitsz_settle_dispatch >/dev/null
+  wait
+  assert_eq "launch:$(cat "${HITSZ_STATE_DIR}/settle.generation")" "$(cat "${trace}")" \
+    'only the newest activation launches a settle'
+)
+
+test_foreground_settle_respects_claimed_token() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  bridge_settle_claim
+  # A newer activation claims the route while this foreground check runs.
+  ( bridge_settle_claim )
+  bridge_wait_for_stable_route() { return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+  bridge_backend_cleanup() { printf 'trim\n' >>"${trace}"; }
+
+  hitsz_mode_settle >/dev/null 2>&1 || fail 'superseded foreground settle must exit quietly'
+  assert_eq '' "$(cat "${trace}")" 'superseded foreground settle side effects'
+)
+
+test_mode_up_claims_before_login_side_effects() (
+  local trace expected
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  bridge_settle_claim() {
+    printf 'claim\n' >>"${trace}"
+    export BRIDGE_SETTLE_TOKEN=t1
+  }
+  hitsz_mode_connect() { printf 'connect\n' >>"${trace}"; }
+  bridge_surge_activate() { printf 'activate\n' >>"${trace}"; }
+  hitsz_settle_dispatch() { printf 'dispatch\n' >>"${trace}"; }
+
+  hitsz_mode_up >/dev/null
+  expected=$'claim\nconnect\nactivate\ndispatch'
+  assert_eq "${expected}" "$(cat "${trace}")" 'claim precedes login and is not repeated'
+)
+
+test_overtaken_activation_never_selects_backend() (
+  local trace token_a
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  bridge_backend_ready() { return 0; }
+  bridge_backend_wait_ready() { return 0; }
+  bridge_backend_prepare_proxy() { return 0; }
+  bridge_surge_select_backend() { printf 'backend\n' >>"${trace}"; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+  bridge_surge_current_selection() { printf 'HITSZ-aTrust\n'; }
+  bridge_site_http_probe() { return 0; }
+
+  # up A claims, then down B claims before A reaches the Surge write.
+  bridge_settle_claim
+  token_a="${BRIDGE_SETTLE_TOKEN}"
+  ( bridge_settle_claim )
+  if BRIDGE_SETTLE_TOKEN="${token_a}" hitsz_mode_activate_route >/dev/null 2>&1; then
+    fail 'an overtaken activation must fail'
+  fi
+  assert_eq '' "$(cat "${trace}")" 'overtaken activation must not touch Surge'
+)
+
+test_concurrent_lock_is_exclusive() (
+  local trace i overlap
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock"
+  critical() {
+    printf 'in %s\n' "$1" >>"${trace}"
+    command sleep 0.15
+    printf 'out %s\n' "$1" >>"${trace}"
+  }
+  for i in 1 2 3 4; do
+    ( bridge_settle_lock && { critical "${i}"; bridge_settle_unlock; } ) &
+  done
+  wait
+  overlap="$(awk '$1=="in"{d++; if(d>m)m=d} $1=="out"{d--} END{print m+0}' "${trace}")"
+  assert_eq '1' "${overlap}" 'at most one lock holder'
+  assert_eq '8' "$(wc -l <"${trace}" | tr -d ' ')" 'every waiter got the lock'
+)
+
+test_claim_without_uuidgen_still_locks() (
+  local bin tool
+  bin="$(mktemp -d -t hitsz-test-bin.XXXXXX)"
+  trap 'rm -rf "${bin}"' EXIT
+  for tool in cat date grep mkdir perl ps rm seq sleep; do
+    ln -s "$(command -v "${tool}")" "${bin}/${tool}"
+  done
+  PATH="${bin}" bridge_settle_claim
+  [[ -n "${BRIDGE_SETTLE_TOKEN}" ]] || fail 'claim must produce a token without uuidgen'
+  assert_eq "${BRIDGE_SETTLE_TOKEN}" "$(cat "${HITSZ_STATE_DIR}/settle.generation")" \
+    'generation without uuidgen'
+)
+
+test_down_aborts_when_route_claim_fails() (
+  local trace fake
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  fake="$(mktemp -d -t hitsz-test-root.XXXXXX)"
+  trap 'rm -f "${trace}"; rm -rf "${fake}"' EXIT
+  # Never reach the real bin/down, even if the guard regresses.
+  mkdir -p "${fake}/bin"
+  printf '#!/bin/sh\necho stop >>"%s"\n' "${trace}" >"${fake}/bin/down"
+  chmod +x "${fake}/bin/down"
+  ROOT_DIR="${fake}"
+
+  bridge_settle_claim() { return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+  hitsz_retest_group() { :; }
+  bridge_site_http_probe() { return 1; }
+
+  if hitsz_mode_down >/dev/null 2>&1; then
+    fail 'down must stop when another command owns the route'
+  fi
+  assert_eq '' "$(cat "${trace}")" 'no DIRECT write or shutdown without the claim'
+)
+
+test_failed_connect_returns_backend_route_to_direct() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  hitsz_mode_connect() { return 1; }
+  bridge_surge_current_selection() { printf 'HITSZ-aTrust\n'; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+
+  if hitsz_mode_up >/dev/null 2>&1; then
+    fail 'up must fail when connect fails'
+  fi
+  assert_eq 'direct' "$(cat "${trace}")" 'unmonitored backend route reverted'
+
+  : >"${trace}"
+  unset BRIDGE_SETTLE_TOKEN
+  bridge_surge_current_selection() { printf 'DIRECT\n'; }
+  hitsz_mode_up >/dev/null 2>&1 || true
+  assert_eq '' "$(cat "${trace}")" 'DIRECT route left alone'
+)
+
+test_status_reports_interrupted_settle() (
+  bridge_settle_job_alive() { return 1; }
+  printf 'running %s\n' "$(($(date +%s) - 60))" >"${HITSZ_STATE_DIR}/settle.state"
+  assert_eq 'INTERRUPTED' "$(bridge_settle_status)" 'dead job left running state'
+  printf 'running %s\n' "$(date +%s)" >"${HITSZ_STATE_DIR}/settle.state"
+  assert_eq '' "$(bridge_settle_status)" 'job still starting'
+  printf 'running 0\n' >"${HITSZ_STATE_DIR}/settle.state"
+  bridge_settle_claim
+  assert_eq '' "$(bridge_settle_status)" 'claim clears the superseded result'
+)
+
+test_down_backs_off_when_superseded_before_shutdown() (
+  local trace fake
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  fake="$(mktemp -d -t hitsz-test-root.XXXXXX)"
+  trap 'rm -f "${trace}"; rm -rf "${fake}"' EXIT
+  mkdir -p "${fake}/bin"
+  printf '#!/bin/sh\necho stop >>"%s"\n' "${trace}" >"${fake}/bin/down"
+  chmod +x "${fake}/bin/down"
+  ROOT_DIR="${fake}"
+
+  # A newer `up` claims right after this down's DIRECT write.
+  bridge_surge_restore_direct() {
+    printf 'direct\n' >>"${trace}"
+    printf 'newer\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  }
+  hitsz_retest_group() { :; }
+  bridge_site_http_probe() { return 1; }
+
+  if hitsz_mode_down >/dev/null 2>&1; then
+    fail 'an overtaken down must not report success'
+  fi
+  assert_eq 'direct' "$(cat "${trace}")" 'overtaken down must not stop the VM'
+)
+
+test_down_reports_failed_shutdown() (
+  local trace fake
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  fake="$(mktemp -d -t hitsz-test-root.XXXXXX)"
+  trap 'rm -f "${trace}"; rm -rf "${fake}"' EXIT
+  mkdir -p "${fake}/bin"
+  printf '#!/bin/sh\nexit 7\n' >"${fake}/bin/down"
+  chmod +x "${fake}/bin/down"
+  ROOT_DIR="${fake}"
+
+  bridge_surge_restore_direct() { return 0; }
+  hitsz_retest_group() { printf 'retest\n' >>"${trace}"; }
+  bridge_site_http_probe() { printf 'probe\n' >>"${trace}"; }
+
+  local rc=0
+  hitsz_mode_down >/dev/null 2>&1 || rc=$?
+  assert_eq '7' "${rc}" 'down propagates a failed shutdown'
+  assert_eq '' "$(cat "${trace}")" 'no probe or success after a failed shutdown'
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -500,6 +965,8 @@ tests=(
   test_stats_race_does_not_abort_status
   test_trusted_renewal_avoids_novnc
   test_novnc_opens_after_grace
+  test_novnc_opens_early_on_waiting_cas_form
+  test_transient_cas_form_does_not_open_novnc
   test_mode_up_triggers_client_login
   test_connect_reuses_running_container
   test_preflight_failure_blocks_reuse
@@ -516,6 +983,30 @@ tests=(
   test_browser_stop_failure_is_visible
   test_post_stop_probe_failure_reverts_direct
   test_failed_finish_does_not_trim
+  test_background_settle_dispatch_records_generation
+  test_foreground_settle_env_keeps_blocking_path
+  test_superseded_settle_never_rolls_back
+  test_current_settle_failure_rolls_back_and_records
+  test_activation_cancels_previous_settle
+  test_status_reports_failed_settle
+  test_ui_renders_settle_row
+  test_cancel_waits_for_inflight_rollback
+  test_superseded_exclusive_skips_side_effect
+  test_stale_settle_lock_is_reclaimed
+  test_cancel_timeout_blocks_new_activation
+  test_late_dispatch_from_older_activation_backs_off
+  test_foreground_settle_respects_claimed_token
+  test_mode_up_claims_before_login_side_effects
+  test_overtaken_activation_never_selects_backend
+  test_concurrent_lock_is_exclusive
+  test_background_settle_does_not_inherit_lock
+  test_guarded_side_effect_does_not_inherit_lock
+  test_claim_without_uuidgen_still_locks
+  test_down_aborts_when_route_claim_fails
+  test_failed_connect_returns_backend_route_to_direct
+  test_status_reports_interrupted_settle
+  test_down_backs_off_when_superseded_before_shutdown
+  test_down_reports_failed_shutdown
 )
 
 for test_name in "${tests[@]}"; do

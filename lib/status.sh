@@ -19,6 +19,7 @@ hitsz_collect_status() {
   HITSZ_STATUS_SOCKS="CLOSED"
   HITSZ_STATUS_JW_CODE="SKIPPED"
   HITSZ_STATUS_POLICY="$(hitsz_current_selection)"
+  HITSZ_STATUS_SETTLE="$(bridge_settle_status)"
 
   if docker_ctx info >/dev/null 2>&1; then
     HITSZ_STATUS_DOCKER="IDLE"

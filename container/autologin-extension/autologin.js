@@ -59,6 +59,21 @@
     );
   }
 
+  let rememberPreselected = false;
+
+  // A persistent CASTGC lets the next relaunch pass CAS SSO without a form.
+  // Pre-select remember-me once so a manual noVNC login keeps that benefit;
+  // never toggle it back if the user clears it afterwards.
+  function preselectRemember(remember) {
+    if (rememberPreselected || !remember) {
+      return;
+    }
+    rememberPreselected = true;
+    if (!remember.checked) {
+      remember.click();
+    }
+  }
+
   function tryTrustedSubmit() {
     if (Date.now() >= deadline || sessionStorage.getItem(attemptKey) === "1") {
       return;
@@ -68,6 +83,8 @@
     const form = password && (password.form || password.closest("form"));
     const submit = form && findSubmitControl(form);
     const remember = form && findRememberControl(form);
+
+    preselectRemember(remember);
 
     if (!password || !form || !submit || !remember ||
         !isBrowserAutofilled(password)) {

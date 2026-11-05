@@ -17,6 +17,12 @@ hitsz_ui_activate_and_settle() {
   local activate_step="${1:-2/3}" settle_step="${2:-3/3}"
   [[ "${stable_seconds}" =~ ^[0-9]+$ ]] || stable_seconds=30
 
+  # Claim here (unless the entrypoint already did) so the token survives the
+  # gum child that runs activation.
+  if [[ -z "${BRIDGE_SETTLE_TOKEN:-}" ]] && ! bridge_settle_claim; then
+    hitsz_mode_status
+    return 1
+  fi
   if ! hitsz_ui_run_action "${activate_step} VPN 已连；接入 Surge 并验证 JW…" \
       "${SCRIPT_PATH}" __core_activate; then
     hitsz_ui_warn_activation_failed "$(hitsz_current_selection)"
@@ -24,11 +30,17 @@ hitsz_ui_activate_and_settle() {
     return 1
   fi
   hitsz_ui_mark_network_ready
-  if ! hitsz_ui_run_action \
-      "${settle_step} 网络已通；验收 ${stable_seconds} 秒稳定性并回收浏览器…" \
-      "${SCRIPT_PATH}" __core_settle; then
-    hitsz_mode_status
-    return 1
+  if [[ "${HITSZ_SETTLE_FOREGROUND:-0}" == "1" ]]; then
+    if ! hitsz_ui_run_action \
+        "${settle_step} 网络已通；验收 ${stable_seconds} 秒稳定性并回收浏览器…" \
+        "${SCRIPT_PATH}" __core_settle; then
+      hitsz_mode_status
+      return 1
+    fi
+  elif hitsz_settle_dispatch >/dev/null; then
+    hitsz_ui_note_background_settle "${stable_seconds}"
+  else
+    gum log --level warn '后台稳定性验收未能启动；可运行 HITSZ_SETTLE_FOREGROUND=1 hitsz up'
   fi
   hitsz_mode_status
 }
@@ -58,6 +70,9 @@ case "${action}" in
   __core_settle)
     hitsz_mode_settle
     ;;
+  __core_settle_bg)
+    hitsz_mode_settle_bg "${2:?missing settle generation}"
+    ;;
   __core_finish)
     hitsz_mode_finish
     ;;
@@ -67,8 +82,15 @@ case "${action}" in
   up | on | outside | external)
     if hitsz_ui_enabled; then
       ensure_env
+      # Claim before any login side effect so an old settle cannot close the
+      # browser this run is about to open.
+      if ! bridge_settle_claim; then
+        hitsz_mode_status
+        exit 1
+      fi
       if ! hitsz_ui_run_action '1/3 启动隔离 aTrust 并恢复会话…' \
           "${SCRIPT_PATH}" __core_connect; then
+        hitsz_mode_connect_failed
         hitsz_ui_show_vnc_credential "$(vnc_password)"
         hitsz_mode_status
         exit 1
@@ -81,6 +103,7 @@ case "${action}" in
     ;;
   login | vnc)
     ensure_env
+    bridge_settle_claim || exit 1
     hitsz_ui_show_vnc_credential "$(vnc_password)"
     hitsz_open_login
     if hitsz_ui_enabled && hitsz_ui_confirm_login; then

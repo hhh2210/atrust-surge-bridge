@@ -2,9 +2,13 @@ ARG ATRUST_BASE=hagb/docker-atrust@sha256:60a9114dc31a10b9a809ceb283697748fe3251
 FROM ${ATRUST_BASE}
 
 ARG DEBIAN_FRONTEND=noninteractive
+# The base image also enables bullseye-security, whose libxnvctrl0 (a chromium
+# dependency) outranks bookworm's but now 404s in the security pool; pin it to
+# the bookworm build that chromium accepts.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends -t bookworm-security \
       chromium imagemagick tesseract-ocr tesseract-ocr-eng xdotool \
+      libxnvctrl0/bookworm \
     && rm -rf /var/lib/apt/lists/*
 
 COPY container/xdg-open /usr/bin/xdg-open

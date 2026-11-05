@@ -22,6 +22,8 @@ hitsz_ui_plain_status() {
   printf 'VPN: %s\n' "${HITSZ_STATUS_VPN}"
   printf 'SOCKS: %s:%s %s\n' \
     "${SITE_SOCKS_HOST}" "${SITE_SOCKS_PORT}" "${HITSZ_STATUS_SOCKS}"
+  [[ -z "${HITSZ_STATUS_SETTLE:-}" ]] ||
+    printf 'Settle: %s (%s)\n' "${HITSZ_STATUS_SETTLE}" "$(bridge_state_dir)/settle.log"
 }
 
 hitsz_ui_render_status() {
@@ -46,7 +48,7 @@ hitsz_ui_render_status() {
   [[ "${HITSZ_STATUS_DOCKER}" == "OFF" ]] && docker_color="${HITSZ_UI_MUTED}" || docker_color="${HITSZ_UI_YELLOW}"
   [[ "${HITSZ_STATUS_VPN}" == "CONNECTED" ]] && vpn_color="${HITSZ_UI_GREEN}" || vpn_color="${HITSZ_UI_MUTED}"
 
-  local title mode jw_value docker_value vpn_value socks_value content
+  local title mode jw_value docker_value vpn_value socks_value settle_value content
   title="$(gum style --bold --foreground "${HITSZ_UI_PURPLE}" 'HITSZ ACCESS')"
   mode="$(gum style --bold --foreground "${mode_color}" "● ${HITSZ_STATUS_MODE}")"
   if [[ "${HITSZ_STATUS_JW_CODE}" == "SKIPPED" ]]; then
@@ -58,6 +60,15 @@ hitsz_ui_render_status() {
   vpn_value="$(gum style --foreground "${vpn_color}" "${HITSZ_STATUS_VPN}")"
   socks_value="$(gum style --foreground "${docker_color}" \
     "${SITE_SOCKS_HOST}:${SITE_SOCKS_PORT} · ${HITSZ_STATUS_SOCKS}")"
+  # bash 3.2 cannot parse a case statement inside $(...); resolve it here.
+  settle_value=""
+  if [[ "${HITSZ_STATUS_SETTLE:-}" == "RUNNING" ]]; then
+    settle_value="$(gum style --foreground "${HITSZ_UI_YELLOW}" '后台验收中')"
+  elif [[ "${HITSZ_STATUS_SETTLE:-}" == "FAILED" ]]; then
+    settle_value="$(gum style --foreground "${HITSZ_UI_RED}" "失败 · $(bridge_state_dir)/settle.log")"
+  elif [[ "${HITSZ_STATUS_SETTLE:-}" == "INTERRUPTED" ]]; then
+    settle_value="$(gum style --foreground "${HITSZ_UI_RED}" "中断，验收未完成 · 重新 hitsz up")"
+  fi
 
   content="$(
     printf '%s\n%s\n\n' "${title}" "${mode}"
@@ -65,6 +76,7 @@ hitsz_ui_render_status() {
     printf '  %-9s %s\n' 'Docker' "${docker_value}"
     printf '  %-9s %s\n' 'VPN' "${vpn_value}"
     printf '  %-9s %s\n' 'SOCKS' "${socks_value}"
+    [[ -z "${settle_value}" ]] || printf '  %-9s %s\n' 'Settle' "${settle_value}"
   )"
 
   gum style --border rounded --border-foreground "${HITSZ_UI_PURPLE}" \
@@ -80,6 +92,16 @@ hitsz_ui_mark_network_ready() {
   fi
   gum style --bold --foreground "${HITSZ_UI_GREEN}" \
     '✓ 校内网络已可用（首次 JW 探测通过）'
+}
+
+hitsz_ui_note_background_settle() {
+  local stable_seconds="${1:-30}"
+  if ! hitsz_ui_enabled; then
+    printf 'Stability check (%ss) continues in the background.\n' "${stable_seconds}"
+    return
+  fi
+  gum style --foreground "${HITSZ_UI_MUTED}" \
+    "  后台继续验收 ${stable_seconds} 秒稳定性并回收浏览器；失败会自动切回 DIRECT（hitsz status 可查看）"
 }
 
 hitsz_ui_warn_activation_failed() {
