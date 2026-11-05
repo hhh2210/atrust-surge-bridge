@@ -139,14 +139,59 @@ bridge_surge_activate() {
     "${SITE_LABEL}"
 }
 
+bridge_state_dir() {
+  printf '%s\n' "${HITSZ_STATE_DIR:-${BRIDGE_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/atrust-surge-bridge/${SITE_ID}}}"
+}
+
+# A background settle owns the route only while its generation token is the
+# current one; any newer activation or a shutdown cancels it before acting.
+bridge_settle_superseded() {
+  local token="${1:-}" current
+  [[ -n "${token}" ]] || return 1
+  current="$(cat "$(bridge_state_dir)/settle.generation" 2>/dev/null || true)"
+  [[ "${current}" != "${token}" ]]
+}
+
+bridge_settle_job_alive() {
+  local pid
+  pid="$(cat "$(bridge_state_dir)/settle.pid" 2>/dev/null || true)"
+  [[ "${pid}" =~ ^[0-9]+$ ]] &&
+    ps -p "${pid}" -o command= 2>/dev/null | grep -q '__core_settle_bg'
+}
+
+bridge_settle_cancel() {
+  local dir pid
+  dir="$(bridge_state_dir)"
+  [[ -d "${dir}" ]] || return 0
+  printf 'cancelled\n' >"${dir}/settle.generation" 2>/dev/null || true
+  if bridge_settle_job_alive; then
+    pid="$(cat "${dir}/settle.pid")"
+    kill "${pid}" 2>/dev/null || true
+  fi
+  rm -f "${dir}/settle.pid"
+}
+
+# Prints RUNNING or FAILED when a background settle needs attention.
+bridge_settle_status() {
+  if bridge_settle_job_alive; then
+    printf 'RUNNING\n'
+  elif [[ "$(cut -d' ' -f1 "$(bridge_state_dir)/settle.state" 2>/dev/null)" == "failed" ]]; then
+    printf 'FAILED\n'
+  fi
+}
+
 bridge_surge_settle() {
+  local token="${1:-}"
   bridge_require_callbacks bridge_backend_ready bridge_backend_cleanup || return 1
   if ! bridge_wait_for_stable_route; then
+    bridge_settle_superseded "${token}" && return 0
     bridge_surge_restore_direct || true
     return 1
   fi
+  bridge_settle_superseded "${token}" && return 0
   bridge_backend_cleanup || return 1
   if ! bridge_site_http_probe; then
+    bridge_settle_superseded "${token}" && return 0
     if bridge_surge_restore_direct; then
       printf 'The %s route failed after %s; reverted %s to %s.\n' \
         "${SITE_BACKEND_LABEL}" "${BRIDGE_CLEANUP_LABEL:-backend cleanup}" \
@@ -162,4 +207,38 @@ bridge_surge_settle() {
   printf '%s outside mode is ready; Surge is pinned to %s until %s.\n' \
     "${SITE_LABEL}" "${SITE_BACKEND_LABEL}" \
     "${BRIDGE_SHUTDOWN_HINT:-shutdown}"
+}
+
+bridge_settle_run_bg() {
+  local token="$1" dir rc=0
+  dir="$(bridge_state_dir)"
+  bridge_surge_settle "${token}" || rc=$?
+  bridge_settle_superseded "${token}" && return 0
+  if [[ "${rc}" -eq 0 ]]; then
+    printf 'ok %s\n' "$(date +%s)" >"${dir}/settle.state"
+  else
+    printf 'failed %s\n' "$(date +%s)" >"${dir}/settle.state"
+  fi
+  rm -f "${dir}/settle.pid"
+  return "${rc}"
+}
+
+# The route is already usable after activation; keep the stability window and
+# its DIRECT rollback, but stop blocking the command on it. $1 is the CLI that
+# implements the `__core_settle_bg <token>` entry point.
+bridge_settle_dispatch() {
+  local cli="$1" dir token log
+  if [[ "${BRIDGE_SETTLE_FOREGROUND:-${HITSZ_SETTLE_FOREGROUND:-0}}" == "1" ]]; then
+    bridge_surge_settle
+    return
+  fi
+  dir="$(bridge_state_dir)"
+  (umask 077 && mkdir -p "${dir}") || return 1
+  token="$(uuidgen)"
+  log="${dir}/settle.log"
+  printf '%s\n' "${token}" >"${dir}/settle.generation"
+  printf 'running %s\n' "$(date +%s)" >"${dir}/settle.state"
+  nohup "${cli}" __core_settle_bg "${token}" >"${log}" 2>&1 </dev/null &
+  printf '%s\n' "$!" >"${dir}/settle.pid"
+  printf 'Stability check continues in the background (log: %s).\n' "${log}"
 }

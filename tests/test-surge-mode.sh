@@ -10,11 +10,17 @@ source "${TEST_ROOT}/lib/common.sh"
 source "${TEST_ROOT}/lib/surge_mode.sh"
 # shellcheck source=../lib/status.sh
 source "${TEST_ROOT}/lib/status.sh"
+# shellcheck source=../lib/ui.sh
+source "${TEST_ROOT}/lib/ui.sh"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
   exit 1
 }
+
+HITSZ_STATE_DIR="$(mktemp -d -t hitsz-test-state.XXXXXX)"
+export HITSZ_STATE_DIR
+trap 'rm -rf "${HITSZ_STATE_DIR}"' EXIT
 
 assert_eq() {
   local expected="$1" actual="$2" label="$3"
@@ -189,6 +195,7 @@ test_trusted_renewal_avoids_novnc() (
     [[ "${checks}" -ge 2 ]]
   }
   hitsz_open_login() { : >"${marker}"; }
+  cas_login_form_visible() { return 1; }
   sleep() { :; }
 
   hitsz_wait_until_ready 1 >/dev/null
@@ -205,10 +212,54 @@ test_novnc_opens_after_grace() (
     [[ "${checks}" -ge 4 ]]
   }
   hitsz_open_login() { opened_at="${checks}"; }
+  cas_login_form_visible() { return 1; }
   sleep() { :; }
 
   hitsz_wait_until_ready 1 >/dev/null
   assert_eq '2' "${opened_at}" 'noVNC grace attempt'
+)
+
+test_novnc_opens_early_on_waiting_cas_form() (
+  local checks=0 opened_at=0 opens=0
+
+  HITSZ_TRUSTED_LOGIN_GRACE_SECONDS=30
+  HITSZ_LOGIN_WAIT_SECONDS=60
+  hitsz_vpn_ready() {
+    checks=$((checks + 1))
+    [[ "${checks}" -ge 10 ]]
+  }
+  # The form appears on the third check and stays until a human submits it.
+  cas_login_form_visible() { [[ "${checks}" -ge 3 ]]; }
+  hitsz_open_login() {
+    opens=$((opens + 1))
+    opened_at="${checks}"
+  }
+  sleep() { :; }
+
+  hitsz_wait_until_ready 1 >/dev/null
+  assert_eq '4' "${opened_at}" 'early noVNC reveal check'
+  assert_eq '1' "${opens}" 'noVNC opens once'
+)
+
+test_transient_cas_form_does_not_open_novnc() (
+  local checks=0 marker
+  marker="$(mktemp -t hitsz-test-novnc.XXXXXX)"
+  rm -f "${marker}"
+  trap 'rm -f "${marker}"' EXIT
+
+  HITSZ_TRUSTED_LOGIN_GRACE_SECONDS=30
+  HITSZ_LOGIN_WAIT_SECONDS=60
+  hitsz_vpn_ready() {
+    checks=$((checks + 1))
+    [[ "${checks}" -ge 4 ]]
+  }
+  # CAS SSO redirects away from the form before a second check sees it.
+  cas_login_form_visible() { [[ "${checks}" -eq 2 ]]; }
+  hitsz_open_login() { : >"${marker}"; }
+  sleep() { :; }
+
+  hitsz_wait_until_ready 1 >/dev/null
+  [[ ! -e "${marker}" ]] || fail 'a CAS SSO pass-through must not open noVNC'
 )
 
 test_mode_up_triggers_client_login() (
@@ -222,10 +273,10 @@ test_mode_up_triggers_client_login() (
   hitsz_vpn_ready() { printf 'vpn\n' >>"${trace}"; return 1; }
   trigger_atrust_login() { printf 'trigger\n' >>"${trace}"; }
   hitsz_wait_until_ready() { printf 'wait:%s\n' "$1" >>"${trace}"; }
-  hitsz_mode_finish() { printf 'finish\n' >>"${trace}"; }
+  hitsz_mode_finish_dispatch() { printf 'finish-dispatch\n' >>"${trace}"; }
 
   hitsz_mode_up >/dev/null
-  expected=$'preflight\nstart\nvpn\ntrigger\nwait:1\nfinish'
+  expected=$'preflight\nstart\nvpn\ntrigger\nwait:1\nfinish-dispatch'
   assert_eq "${expected}" "$(cat "${trace}")" 'mode up login trigger order'
 )
 
@@ -489,6 +540,104 @@ test_failed_finish_does_not_trim() (
   assert_eq "${expected}" "$(cat "${trace}")" 'failed finish order'
 )
 
+test_background_settle_dispatch_records_generation() (
+  local trace launched
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  nohup() { printf '%s\n' "$*" >"${trace}"; }
+  bridge_surge_settle() { fail 'background dispatch must not settle in the foreground'; }
+
+  hitsz_settle_dispatch >/dev/null
+  wait
+  launched="$(cat "${trace}")"
+  [[ "${launched}" == *"/bin/hitsz __core_settle_bg $(cat "${HITSZ_STATE_DIR}/settle.generation")" ]] ||
+    fail "unexpected background settle command: ${launched}"
+  assert_eq 'running' "$(cut -d' ' -f1 "${HITSZ_STATE_DIR}/settle.state")" 'dispatch state'
+)
+
+test_foreground_settle_env_keeps_blocking_path() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  export HITSZ_SETTLE_FOREGROUND=1
+  nohup() { fail 'foreground settle must not launch a background job'; }
+  bridge_surge_settle() { printf 'settle:%s\n' "${1:-}" >>"${trace}"; }
+
+  hitsz_settle_dispatch
+  assert_eq 'settle:' "$(cat "${trace}")" 'foreground settle call'
+)
+
+test_superseded_settle_never_rolls_back() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  printf 'newer-generation\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  bridge_wait_for_stable_route() { return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+  bridge_backend_cleanup() { printf 'trim\n' >>"${trace}"; }
+
+  hitsz_mode_settle_bg 'old-generation' || fail 'superseded settle must exit quietly'
+  assert_eq '' "$(cat "${trace}")" 'superseded settle side effects'
+)
+
+test_current_settle_failure_rolls_back_and_records() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  bridge_wait_for_stable_route() { return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+
+  if hitsz_mode_settle_bg 'gen-1' >/dev/null 2>&1; then
+    fail 'an unstable current settle must fail'
+  fi
+  assert_eq 'direct' "$(cat "${trace}")" 'current settle rollback'
+  assert_eq 'failed' "$(cut -d' ' -f1 "${HITSZ_STATE_DIR}/settle.state")" 'failed settle state'
+)
+
+test_activation_cancels_previous_settle() (
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  bridge_surge_activate() { return 0; }
+
+  hitsz_mode_activate_route >/dev/null
+  bridge_settle_superseded 'gen-1' || fail 'a new activation must supersede the old settle'
+)
+
+test_status_reports_failed_settle() (
+  printf 'failed 0\n' >"${HITSZ_STATE_DIR}/settle.state"
+  rm -f "${HITSZ_STATE_DIR}/settle.pid"
+  docker_ctx() { return 1; }
+  nc() { return 1; }
+  hitsz_current_selection() { printf 'DIRECT\n'; }
+  hitsz_status_jw_code() { printf '000\n'; }
+
+  hitsz_collect_status
+  assert_eq 'FAILED' "${HITSZ_STATUS_SETTLE}" 'failed settle status'
+)
+
+test_ui_renders_settle_row() (
+  local output
+  hitsz_ui_enabled() { return 0; }
+  # Echo the last argument so rendered rows stay visible without gum.
+  gum() { local last; for last in "$@"; do :; done; printf '%s\n' "${last}"; }
+  HITSZ_STATUS_MODE='校外 aTrust'
+  HITSZ_STATUS_JW_CODE='200'
+  HITSZ_STATUS_POLICY='HITSZ-aTrust'
+  HITSZ_STATUS_DOCKER='ON'
+  HITSZ_STATUS_USAGE=''
+  HITSZ_STATUS_VPN='CONNECTED'
+  HITSZ_STATUS_SOCKS='OPEN'
+  HITSZ_STATUS_SETTLE='RUNNING'
+
+  output="$(hitsz_ui_render_status 2>&1)"
+  [[ "${output}" == *'Settle'*'后台验收中'* ]] || fail "settle row missing: ${output}"
+  [[ "${output}" != *'syntax error'* ]] || fail "status UI failed to parse: ${output}"
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -500,6 +649,8 @@ tests=(
   test_stats_race_does_not_abort_status
   test_trusted_renewal_avoids_novnc
   test_novnc_opens_after_grace
+  test_novnc_opens_early_on_waiting_cas_form
+  test_transient_cas_form_does_not_open_novnc
   test_mode_up_triggers_client_login
   test_connect_reuses_running_container
   test_preflight_failure_blocks_reuse
@@ -516,6 +667,13 @@ tests=(
   test_browser_stop_failure_is_visible
   test_post_stop_probe_failure_reverts_direct
   test_failed_finish_does_not_trim
+  test_background_settle_dispatch_records_generation
+  test_foreground_settle_env_keeps_blocking_path
+  test_superseded_settle_never_rolls_back
+  test_current_settle_failure_rolls_back_and_records
+  test_activation_cancels_previous_settle
+  test_status_reports_failed_settle
+  test_ui_renders_settle_row
 )
 
 for test_name in "${tests[@]}"; do

@@ -139,13 +139,45 @@ compose() {
     "$@"
 }
 
+ATRUST_IMAGE="atrust-surge:2.5.16.20-chromium-arm64"
+ATRUST_BASE_IMAGE="hagb/docker-atrust@sha256:60a9114dc31a10b9a809ceb283697748fe325143c78689fc9300522f89af6875"
+ATRUST_CONTEXT_LABEL="io.github.hhh2210.atrust-surge.context-sha256"
+
+# Hash every input the Dockerfile can see. A cached buildx run still resolves
+# the pinned base image against the registry (~3 s), so skip it when unchanged.
+atrust_build_context_hash() {
+  (
+    cd "${ROOT_DIR}" || exit 1
+    {
+      printf 'base=%s\n' "${ATRUST_BASE_IMAGE}"
+      find Dockerfile .dockerignore container patches -type f -print0 |
+        LC_ALL=C sort -z | xargs -0 shasum -a 256
+    } | shasum -a 256 | cut -d' ' -f1
+  )
+}
+
+atrust_image_current() {
+  local expected="$1" actual
+  actual="$(docker_ctx image inspect \
+    -f "{{ index .Config.Labels \"${ATRUST_CONTEXT_LABEL}\" }}" \
+    "${ATRUST_IMAGE}" 2>/dev/null || true)"
+  [[ -n "${expected}" && "${actual}" == "${expected}" ]]
+}
+
 build_atrust_image() {
+  local context_hash
+  context_hash="$(atrust_build_context_hash)" || context_hash=""
+  if [[ "${HITSZ_FORCE_BUILD:-0}" != "1" ]] && atrust_image_current "${context_hash}"; then
+    printf 'aTrust image is current (context %s); skipping build.\n' "${context_hash:0:12}"
+    return 0
+  fi
   DOCKER_CONFIG="${DOCKER_CONFIG_DIR}" DOCKER_HOST="${DOCKER_SOCKET}" \
     docker-buildx build \
       --platform linux/arm64 \
       --load \
-      --tag atrust-surge:2.5.16.20-chromium-arm64 \
-      --build-arg ATRUST_BASE=hagb/docker-atrust@sha256:60a9114dc31a10b9a809ceb283697748fe325143c78689fc9300522f89af6875 \
+      --tag "${ATRUST_IMAGE}" \
+      --label "${ATRUST_CONTEXT_LABEL}=${context_hash}" \
+      --build-arg "ATRUST_BASE=${ATRUST_BASE_IMAGE}" \
       "${ROOT_DIR}"
 }
 
@@ -195,6 +227,16 @@ manual_login_latched() {
     docker_ctx exec -e "ATRUST_BROWSER_LOCK_WAIT_SECONDS=${lock_wait}" \
       "${CONTAINER_NAME}" \
       /usr/local/bin/atrust-browser-control latched >/dev/null 2>&1
+}
+
+# The CAS SSO redirect passes this page within the same second, so a form that
+# stays visible means the login needs a human (no saved password to autofill).
+cas_login_form_visible() {
+  # xdotool search takes one trailing pattern, so anchor the window-title suffix
+  # instead of combining --class and --name.
+  local title_re="${ATRUST_CAS_LOGIN_TITLE_RE:-^(Unified identity authentication platform|统一身份认证).* - Chromium$}"
+  docker_ctx exec -e DISPLAY=:1 "${CONTAINER_NAME}" \
+    xdotool search --onlyvisible --name "${title_re}" >/dev/null 2>&1
 }
 
 trigger_atrust_login() {

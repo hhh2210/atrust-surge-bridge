@@ -76,13 +76,15 @@ hitsz_wait_until_ready() {
   local auto_open="${1:-1}"
   local max_seconds="${HITSZ_LOGIN_WAIT_SECONDS:-180}"
   local grace_seconds="${HITSZ_TRUSTED_LOGIN_GRACE_SECONDS:-30}"
+  local reveal_checks="${HITSZ_CAS_FORM_REVEAL_CHECKS:-2}"
   local attempts=$((max_seconds / 2))
   local open_attempt=$(((grace_seconds + 1) / 2))
-  local opened=0 i
+  local opened=0 form_checks=0 i
 
   [[ "${open_attempt}" -ge 1 ]] || open_attempt=1
+  [[ "${reveal_checks}" =~ ^[1-9][0-9]*$ ]] || reveal_checks=2
   if [[ "${auto_open}" -eq 1 ]]; then
-    printf 'Waiting up to %ss for trusted-terminal renewal before showing noVNC...\n' \
+    printf 'Waiting for trusted-terminal renewal; noVNC opens once the CAS form needs input (at most %ss)...\n' \
       "${grace_seconds}"
   fi
 
@@ -91,10 +93,21 @@ hitsz_wait_until_ready() {
       return 0
     fi
 
-    if [[ "${auto_open}" -eq 1 && "${i}" -eq "${open_attempt}" && "${opened}" -eq 0 ]]; then
-      printf 'Trusted-terminal renewal needs attention; opening loopback-only noVNC...\n'
-      hitsz_open_login
-      opened=1
+    if [[ "${auto_open}" -eq 1 && "${opened}" -eq 0 ]]; then
+      if cas_login_form_visible; then
+        form_checks=$((form_checks + 1))
+      else
+        form_checks=0
+      fi
+      if [[ "${form_checks}" -ge "${reveal_checks}" ]]; then
+        printf 'The CAS login form is waiting for input; opening loopback-only noVNC...\n'
+        hitsz_open_login
+        opened=1
+      elif [[ "${i}" -ge "${open_attempt}" ]]; then
+        printf 'Trusted-terminal renewal needs attention; opening loopback-only noVNC...\n'
+        hitsz_open_login
+        opened=1
+      fi
     fi
     sleep 2
   done
@@ -158,17 +171,31 @@ bridge_backend_cleanup() {
   printf 'Login Chromium stopped to release VM memory.\n'
 }
 
-hitsz_mode_activate_route() { bridge_surge_activate; }
+# A newer activation supersedes any background settle before touching Surge.
+hitsz_mode_activate_route() {
+  bridge_settle_cancel
+  bridge_surge_activate
+}
 hitsz_mode_settle() { bridge_surge_settle; }
+hitsz_mode_settle_bg() { bridge_settle_run_bg "$@"; }
+
+hitsz_settle_dispatch() {
+  bridge_settle_dispatch "${ROOT_DIR}/bin/hitsz"
+}
 
 hitsz_mode_finish() {
   hitsz_mode_activate_route || return 1
   hitsz_mode_settle
 }
 
+hitsz_mode_finish_dispatch() {
+  hitsz_mode_activate_route || return 1
+  hitsz_settle_dispatch
+}
+
 hitsz_mode_up() {
   hitsz_mode_connect || return 1
-  hitsz_mode_finish
+  hitsz_mode_finish_dispatch
 }
 
 hitsz_open_login() {
@@ -184,6 +211,7 @@ hitsz_open_login() {
 }
 
 hitsz_mode_down() {
+  bridge_settle_cancel
   if ! hitsz_restore_direct_route; then
     printf 'Refusing to stop the bridge because HITSZ=DIRECT was not verified.\n' >&2
     return 1

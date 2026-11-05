@@ -94,6 +94,10 @@ assert.equal(alreadyRemembered.rememberClicks, 0);
 const notAutofilled = runCase(`?${trustedService}`, false);
 assert.equal(notAutofilled.clicks, 0);
 assert.ok(notAutofilled.queries > 0);
+// Manual noVNC logins still get remember-me, exactly once.
+assert.equal(notAutofilled.rememberClicks, 1);
+const notAutofilledRemembered = runCase(`?${trustedService}`, false, true, true, true);
+assert.equal(notAutofilledRemembered.rememberClicks, 0);
 const missingSubmit = runCase(`?${trustedService}`, true, false);
 assert.equal(missingSubmit.clicks, 0);
 assert.ok(missingSubmit.formQueries > 0);

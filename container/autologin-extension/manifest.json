@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "HITSZ Trusted-Terminal Submit",
-  "version": "1.0.0",
-  "description": "Submits the HITSZ CAS form only after Chromium's own password autofill is active.",
+  "version": "1.1.0",
+  "description": "Pre-selects HITSZ CAS remember-me and submits the form only after Chromium's own password autofill is active.",
   "content_scripts": [
     {
       "matches": [

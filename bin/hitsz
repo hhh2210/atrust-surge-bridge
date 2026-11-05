@@ -24,11 +24,17 @@ hitsz_ui_activate_and_settle() {
     return 1
   fi
   hitsz_ui_mark_network_ready
-  if ! hitsz_ui_run_action \
-      "${settle_step} 网络已通；验收 ${stable_seconds} 秒稳定性并回收浏览器…" \
-      "${SCRIPT_PATH}" __core_settle; then
-    hitsz_mode_status
-    return 1
+  if [[ "${HITSZ_SETTLE_FOREGROUND:-0}" == "1" ]]; then
+    if ! hitsz_ui_run_action \
+        "${settle_step} 网络已通；验收 ${stable_seconds} 秒稳定性并回收浏览器…" \
+        "${SCRIPT_PATH}" __core_settle; then
+      hitsz_mode_status
+      return 1
+    fi
+  elif hitsz_settle_dispatch >/dev/null; then
+    hitsz_ui_note_background_settle "${stable_seconds}"
+  else
+    gum log --level warn '后台稳定性验收未能启动；可运行 HITSZ_SETTLE_FOREGROUND=1 hitsz up'
   fi
   hitsz_mode_status
 }
@@ -57,6 +63,9 @@ case "${action}" in
     ;;
   __core_settle)
     hitsz_mode_settle
+    ;;
+  __core_settle_bg)
+    hitsz_mode_settle_bg "${2:?missing settle generation}"
     ;;
   __core_finish)
     hitsz_mode_finish
