@@ -31,6 +31,7 @@ ensure_tools() {
   require_command docker-compose
   require_command nc
   require_command jq
+  require_command perl
   ensure_docker_config
 }
 

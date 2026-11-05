@@ -141,8 +141,11 @@ shows `Settle` while the check runs, after it failed, or when it was
 interrupted before recording a result (for example by a restart). Each
 background check carries a generation token, and any later activation or
 `hitsz down` cancels it first, so a stale check can never revert a newer
-connection. `hitsz down` refuses to stop the bridge while another `hitsz`
-command still holds the route, and an `up` whose connection setup fails returns
+connection. Route changes are serialized by a kernel `flock` on
+`settle.lock` (taken through the system `perl`, since macOS has no `flock(1)`),
+so a crashed command never leaves a stale lock behind. `hitsz down` refuses to
+stop the bridge while another `hitsz` command still holds the route, keeps it
+until the VM has stopped, and an `up` whose connection setup fails returns
 a `HITSZ-aTrust` selection to `DIRECT` instead of leaving it unchecked. Set
 `HITSZ_SETTLE_FOREGROUND=1` to keep the old blocking behaviour.
 If the bridge container is already running, `hitsz up` reuses it instead of

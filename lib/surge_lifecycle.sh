@@ -173,84 +173,44 @@ bridge_settle_job_alive() {
     ps -p "${pid}" -o command= 2>/dev/null | grep -q '__core_settle_bg'
 }
 
-# Creates FILE holding the caller's identity only if FILE does not exist yet.
-# Bash noclobber opens with O_CREAT|O_EXCL itself, so exclusivity does not
-# depend on the mkdir(1) implementation: uutils mkdir on Ubuntu 26.04 let
-# several racers "create" the same directory.
-bridge_settle_create_exclusive() {
-  (set -C && printf '%s\n' "$2" >"$1") 2>/dev/null
-}
-
-# PID plus process start time, so a PID reused after a crash or reboot is not
-# mistaken for the original owner.
-bridge_settle_identity() {
-  local started
-  started="$(ps -p "$1" -o lstart= 2>/dev/null || true)"
-  started="${started#"${started%%[![:space:]]*}"}"
-  started="${started%"${started##*[![:space:]]}"}"
-  printf '%s %s\n' "$1" "${started}"
-}
-
-# Succeeds when OWNER (an identity line from a lock file) is provably dead:
-# its PID is gone, or now belongs to a process that started at another time.
-# An empty or malformed owner is a lock still being written, never dead.
-bridge_settle_owner_dead() {
-  local owner="$1" pid started
-  pid="${owner%% *}"
-  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "${pid}" 2>/dev/null || return 0
-  started="${owner#"${pid}"}"
-  started="${started# }"
-  [[ -n "${started}" ]] || return 1
-  [[ "$(bridge_settle_identity "${pid}")" != "${owner}" ]]
-}
-
-# macOS ships no flock(1). The owner identity in the lock file lets a later
-# caller reclaim a lock left by a killed process.
+# A kernel flock(2) on fd 9, so a crash or reboot can never leave a stale
+# lock: it is released when the last descriptor of the open file closes. macOS
+# has no flock(1); perl (shipped with macOS, Essential on Debian/Ubuntu) locks
+# the inherited fd, and the lock stays with the shell's open file after perl
+# exits. Take it in the process that runs the side effect, never inside
+# $(...), and keep fd 9 out of long-lived children (see bridge_settle_exclusive
+# and bridge_settle_dispatch) or they would hold the lock after we release it.
 bridge_settle_lock() {
-  local lock owner self _
-  lock="$(bridge_state_dir)/settle.lock"
-  self="$(bridge_settle_identity "$$")"
+  local dir
+  dir="$(bridge_state_dir)"
+  if ! command -v perl >/dev/null 2>&1; then
+    printf 'perl is required for the settle lock.\n' >&2
+    return 1
+  fi
+  if ! { (umask 077 && mkdir -p "${dir}") && exec 9>>"${dir}/settle.lock"; } 2>/dev/null; then
+    printf 'Cannot open the settle lock in %s.\n' "${dir}" >&2
+    return 1
+  fi
   # 60 s covers the slowest guarded side effect: `bin/down` (a 25 s compose
   # timeout plus the VM stop) or a Chromium stop that may wait 25 s for the
   # in-container browser lock and 20 s for a clean exit.
-  for _ in $(seq 1 "${BRIDGE_SETTLE_LOCK_WAIT_TICKS:-600}"); do
-    if bridge_settle_create_exclusive "${lock}" "${self}"; then
-      return 0
-    fi
-    owner="$(cat "${lock}" 2>/dev/null || true)"
-    if bridge_settle_owner_dead "${owner}" &&
-      bridge_settle_reclaim "${lock}" "${owner}"; then
-      continue
-    fi
-    sleep 0.1
-  done
+  # shellcheck disable=SC2016 # perl code, not shell
+  if perl -MFcntl=:flock -e '
+      open(my $fh, ">&=", 9) or exit 2;
+      for (1 .. $ARGV[0]) {
+        exit 0 if flock($fh, LOCK_EX | LOCK_NB);
+        select(undef, undef, undef, 0.1);
+      }
+      exit 1' "${BRIDGE_SETTLE_LOCK_WAIT_TICKS:-600}"; then
+    return 0
+  fi
+  exec 9>&-
   printf 'Timed out waiting for the settle lock.\n' >&2
   return 1
 }
 
-# Only the waiter holding the reclaim guard may delete a dead owner's lock,
-# and it re-reads the owner under the guard, so a second waiter that saw the
-# same dead owner cannot delete the fresh lock the first one just created.
-# Nobody else can replace the lock meanwhile: it only disappears through this
-# guarded removal, and its dead owner will never unlock it.
-bridge_settle_reclaim() {
-  local lock="$1" dead_owner="$2" guard
-  guard="${lock}.reclaim"
-  if ! bridge_settle_create_exclusive "${guard}" "$(bridge_settle_identity "$$")"; then
-    if bridge_settle_owner_dead "$(cat "${guard}" 2>/dev/null || true)"; then
-      rm -f "${guard}"
-    fi
-    return 1
-  fi
-  if [[ "$(cat "${lock}" 2>/dev/null || true)" == "${dead_owner}" ]]; then
-    rm -f "${lock}"
-  fi
-  rm -f "${guard}"
-}
-
 bridge_settle_unlock() {
-  rm -f "$(bridge_state_dir)/settle.lock"
+  exec 9>&-
 }
 
 # uuidgen ships with macOS but not with every Linux base image.
@@ -279,7 +239,9 @@ bridge_settle_exclusive() {
     bridge_settle_unlock
     return 3
   fi
-  "$@" || rc=$?
+  # The shell keeps holding the lock; children (surge-cli, docker, colima)
+  # must not inherit it.
+  "$@" 9>&- || rc=$?
   bridge_settle_unlock
   return "${rc}"
 }
@@ -403,7 +365,7 @@ bridge_settle_dispatch() {
     return 0
   fi
   printf 'running %s\n' "$(date +%s)" >"${dir}/settle.state"
-  nohup "${cli}" __core_settle_bg "${token}" >"${log}" 2>&1 </dev/null &
+  nohup "${cli}" __core_settle_bg "${token}" >"${log}" 2>&1 </dev/null 9>&- &
   printf '%s\n' "$!" >"${dir}/settle.pid"
   bridge_settle_unlock
   printf 'Stability check continues in the background (log: %s).\n' "${log}"

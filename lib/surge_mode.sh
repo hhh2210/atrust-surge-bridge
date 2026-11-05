@@ -264,6 +264,10 @@ hitsz_mode_down() {
     hitsz_mode_down_superseded
     return 1
   fi
+  if [[ "${rc}" -ne 0 ]]; then
+    printf 'Stopping the bridge failed; the container or Colima VM may still be running.\n' >&2
+    return "${rc}"
+  fi
   hitsz_retest_group || true
   if hitsz_normal_jw_probe; then
     printf 'HITSZ direct access is available on the current network.\n'

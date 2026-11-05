@@ -657,7 +657,7 @@ test_cancel_waits_for_inflight_rollback() (
   printf 'activate\n' >>"${trace}"
   wait "${bg}" || true
   assert_eq $'direct\nactivate' "$(cat "${trace}")" 'cancel waits for in-flight rollback'
-  [[ ! -e "${HITSZ_STATE_DIR}/settle.lock" ]] || fail 'settle lock must be released'
+  ( BRIDGE_SETTLE_LOCK_WAIT_TICKS=1 bridge_settle_lock ) 2>/dev/null || fail 'settle lock must be released'
 )
 
 test_superseded_exclusive_skips_side_effect() (
@@ -669,21 +669,38 @@ test_superseded_exclusive_skips_side_effect() (
 )
 
 test_stale_settle_lock_is_reclaimed() (
+  # A lock file left by a crash or reboot holds no kernel lock.
   printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock"
   export BRIDGE_SETTLE_LOCK_WAIT_TICKS=5
-  bridge_settle_lock || fail 'a lock owned by a dead PID must be reclaimed'
+  bridge_settle_lock || fail 'a lock file without a live holder must not block'
   bridge_settle_unlock
 )
 
+# Starts a background process that holds the settle lock; prints its PID.
+start_lock_holder() {
+  local ready="$1"
+  ( bridge_settle_lock && : >"${ready}" && exec sleep 30 ) >/dev/null 2>&1 &
+  printf '%s\n' "$!"
+}
+
+wait_for_file() {
+  local _
+  for _ in $(seq 1 50); do
+    [[ -e "$1" ]] && return 0
+    command sleep 0.1
+  done
+  fail "timed out waiting for $1"
+}
+
 test_cancel_timeout_blocks_new_activation() (
-  local holder trace
+  local holder trace ready
   trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
-  command sleep 30 &
-  holder=$!
-  trap 'kill "${holder}" 2>/dev/null; rm -f "${trace}"' EXIT
+  ready="${trace}.ready"
+  holder="$(start_lock_holder "${ready}")"
+  trap 'kill "${holder}" 2>/dev/null || true; rm -f "${trace}" "${ready}"' EXIT
+  wait_for_file "${ready}"
 
   printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
-  bridge_settle_identity "${holder}" >"${HITSZ_STATE_DIR}/settle.lock"
   export BRIDGE_SETTLE_LOCK_WAIT_TICKS=2
   bridge_surge_activate() { printf 'activate\n' >>"${trace}"; }
 
@@ -692,7 +709,38 @@ test_cancel_timeout_blocks_new_activation() (
   fi
   assert_eq '' "$(cat "${trace}")" 'no activation behind a live settle lock'
   assert_eq 'gen-1' "$(cat "${HITSZ_STATE_DIR}/settle.generation")" 'old generation kept'
-  rm -f "${HITSZ_STATE_DIR}/settle.lock"
+  kill "${holder}" 2>/dev/null
+  wait "${holder}" 2>/dev/null || true
+  ( bridge_settle_lock ) || fail 'the lock must free when its holder dies'
+)
+
+test_background_settle_does_not_inherit_lock() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+  # A detached child that kept fd 9 would hold the lock for its lifetime.
+  nohup() { command sleep 3 & printf '%s\n' "$!" >"${trace}"; }
+
+  bridge_settle_claim
+  hitsz_settle_dispatch >/dev/null
+  BRIDGE_SETTLE_LOCK_WAIT_TICKS=5 bridge_settle_lock ||
+    fail 'the background settle must not inherit the settle lock'
+  bridge_settle_unlock
+  kill "$(cat "${trace}")" 2>/dev/null || true
+)
+
+test_guarded_side_effect_does_not_inherit_lock() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  side_effect() { command sleep 3 & printf '%s\n' "$!" >"${trace}"; }
+
+  bridge_settle_exclusive 'gen-1' side_effect
+  BRIDGE_SETTLE_LOCK_WAIT_TICKS=5 bridge_settle_lock ||
+    fail 'a child of a guarded side effect must not inherit the settle lock'
+  bridge_settle_unlock
+  kill "$(cat "${trace}")" 2>/dev/null || true
 )
 
 test_late_dispatch_from_older_activation_backs_off() (
@@ -775,14 +823,11 @@ test_overtaken_activation_never_selects_backend() (
   assert_eq '' "$(cat "${trace}")" 'overtaken activation must not touch Surge'
 )
 
-test_concurrent_stale_lock_reclaim_is_exclusive() (
+test_concurrent_lock_is_exclusive() (
   local trace i overlap
   trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
   trap 'rm -f "${trace}"' EXIT
 
-  # uutils mkdir (Ubuntu 26.04) reported success to several racers creating
-  # the same directory; the lock must not depend on mkdir at all.
-  mkdir() { command mkdir -p "$@" 2>/dev/null || true; }
   printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock"
   critical() {
     printf 'in %s\n' "$1" >>"${trace}"
@@ -794,23 +839,15 @@ test_concurrent_stale_lock_reclaim_is_exclusive() (
   done
   wait
   overlap="$(awk '$1=="in"{d++; if(d>m)m=d} $1=="out"{d--} END{print m+0}' "${trace}")"
-  assert_eq '1' "${overlap}" 'at most one holder after a stale-lock reclaim'
+  assert_eq '1' "${overlap}" 'at most one lock holder'
   assert_eq '8' "$(wc -l <"${trace}" | tr -d ' ')" 'every waiter got the lock'
-)
-
-test_reclaim_skips_lock_replaced_by_live_owner() (
-  printf '%s\n' "$$" >"${HITSZ_STATE_DIR}/settle.lock"
-  # A waiter that earlier saw a dead owner must not delete the live lock.
-  bridge_settle_reclaim "${HITSZ_STATE_DIR}/settle.lock" 999999 || true
-  [[ -e "${HITSZ_STATE_DIR}/settle.lock" ]] || fail 'reclaim deleted a live lock'
-  rm -f "${HITSZ_STATE_DIR}/settle.lock"
 )
 
 test_claim_without_uuidgen_still_locks() (
   local bin tool
   bin="$(mktemp -d -t hitsz-test-bin.XXXXXX)"
   trap 'rm -rf "${bin}"' EXIT
-  for tool in cat date grep mkdir ps rm seq sleep; do
+  for tool in cat date grep mkdir perl ps rm seq sleep; do
     ln -s "$(command -v "${tool}")" "${bin}/${tool}"
   done
   PATH="${bin}" bridge_settle_claim
@@ -897,14 +934,24 @@ test_down_backs_off_when_superseded_before_shutdown() (
   assert_eq 'direct' "$(cat "${trace}")" 'overtaken down must not stop the VM'
 )
 
-test_reused_lock_pid_is_reclaimed() (
-  # After a reboot the dead owner's PID may belong to an unrelated process.
-  printf '%s Thu Jan  1 00:00:00 1970\n' "$$" >"${HITSZ_STATE_DIR}/settle.lock"
-  export BRIDGE_SETTLE_LOCK_WAIT_TICKS=5
-  bridge_settle_lock || fail 'a lock whose PID was reused must be reclaimed'
-  assert_eq "$(bridge_settle_identity "$$")" "$(cat "${HITSZ_STATE_DIR}/settle.lock")" \
-    'reclaimed lock owner'
-  bridge_settle_unlock
+test_down_reports_failed_shutdown() (
+  local trace fake
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  fake="$(mktemp -d -t hitsz-test-root.XXXXXX)"
+  trap 'rm -f "${trace}"; rm -rf "${fake}"' EXIT
+  mkdir -p "${fake}/bin"
+  printf '#!/bin/sh\nexit 7\n' >"${fake}/bin/down"
+  chmod +x "${fake}/bin/down"
+  ROOT_DIR="${fake}"
+
+  bridge_surge_restore_direct() { return 0; }
+  hitsz_retest_group() { printf 'retest\n' >>"${trace}"; }
+  bridge_site_http_probe() { printf 'probe\n' >>"${trace}"; }
+
+  local rc=0
+  hitsz_mode_down >/dev/null 2>&1 || rc=$?
+  assert_eq '7' "${rc}" 'down propagates a failed shutdown'
+  assert_eq '' "$(cat "${trace}")" 'no probe or success after a failed shutdown'
 )
 
 tests=(
@@ -951,14 +998,15 @@ tests=(
   test_foreground_settle_respects_claimed_token
   test_mode_up_claims_before_login_side_effects
   test_overtaken_activation_never_selects_backend
-  test_concurrent_stale_lock_reclaim_is_exclusive
+  test_concurrent_lock_is_exclusive
+  test_background_settle_does_not_inherit_lock
+  test_guarded_side_effect_does_not_inherit_lock
   test_claim_without_uuidgen_still_locks
-  test_reclaim_skips_lock_replaced_by_live_owner
   test_down_aborts_when_route_claim_fails
   test_failed_connect_returns_backend_route_to_direct
   test_status_reports_interrupted_settle
   test_down_backs_off_when_superseded_before_shutdown
-  test_reused_lock_pid_is_reclaimed
+  test_down_reports_failed_shutdown
 )
 
 for test_name in "${tests[@]}"; do
