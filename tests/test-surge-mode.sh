@@ -794,7 +794,13 @@ test_concurrent_stale_lock_reclaim_is_exclusive() (
   done
   wait
   overlap="$(awk '$1=="in"{d++; if(d>m)m=d} $1=="out"{d--} END{print m+0}' "${trace}")"
-  [[ "${overlap}" == '1' ]] || cat "${trace}" >&2
+  if [[ "${overlap}" != '1' ]]; then
+    cat "${trace}" >&2
+    # Diagnose: does kill -0 see this live test process from a waiter?
+    ( kill -0 "$$"; printf 'kill -0 $$=%s rc=%s\n' "$$" "$?" >&2 ) 2>&1
+    ( out="$(kill -0 "$$" 2>&1)"; printf 'stderr=[%s] type=%s\n' "${out}" "$(type -t kill)" >&2 )
+    ls -la "${HITSZ_STATE_DIR}" >&2
+  fi
   assert_eq '1' "${overlap}" 'at most one holder after a stale-lock reclaim'
   assert_eq '8' "$(wc -l <"${trace}" | tr -d ' ')" 'every waiter got the lock'
 )
