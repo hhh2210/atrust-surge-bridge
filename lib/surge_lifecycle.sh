@@ -186,14 +186,36 @@ bridge_settle_lock() {
       return 0
     fi
     owner="$(cat "${lock}/pid" 2>/dev/null || true)"
-    if [[ "${owner}" =~ ^[0-9]+$ ]] && ! kill -0 "${owner}" 2>/dev/null; then
-      rm -rf "${lock}"
+    if [[ "${owner}" =~ ^[0-9]+$ ]] && ! kill -0 "${owner}" 2>/dev/null &&
+      bridge_settle_reclaim "${lock}" "${owner}"; then
       continue
     fi
     sleep 0.1
   done
   printf 'Timed out waiting for the settle lock.\n' >&2
   return 1
+}
+
+# Only the waiter holding the reclaim guard may delete a dead owner's lock,
+# and it re-reads the owner under the guard, so a second waiter that saw the
+# same dead PID cannot delete the fresh lock the first one just created.
+# Nobody else can replace the lock meanwhile: it only disappears through this
+# guarded removal, and its dead owner will never unlock it.
+bridge_settle_reclaim() {
+  local lock="$1" dead_owner="$2" guard guard_owner
+  guard="${lock}.reclaim"
+  if ! mkdir "${guard}" 2>/dev/null; then
+    guard_owner="$(cat "${guard}/pid" 2>/dev/null || true)"
+    if [[ "${guard_owner}" =~ ^[0-9]+$ ]] && ! kill -0 "${guard_owner}" 2>/dev/null; then
+      rm -rf "${guard}"
+    fi
+    return 1
+  fi
+  printf '%s\n' "$$" >"${guard}/pid"
+  if [[ "$(cat "${lock}/pid" 2>/dev/null || true)" == "${dead_owner}" ]]; then
+    rm -rf "${lock}"
+  fi
+  rm -rf "${guard}"
 }
 
 bridge_settle_unlock() {

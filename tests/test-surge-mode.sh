@@ -777,6 +777,36 @@ test_overtaken_activation_never_selects_backend() (
   assert_eq '' "$(cat "${trace}")" 'overtaken activation must not touch Surge'
 )
 
+test_concurrent_stale_lock_reclaim_is_exclusive() (
+  local trace i overlap
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
+  printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock/pid"
+  critical() {
+    printf 'in\n' >>"${trace}"
+    command sleep 0.15
+    printf 'out\n' >>"${trace}"
+  }
+  for i in 1 2 3 4; do
+    ( bridge_settle_lock && { critical; bridge_settle_unlock; } ) &
+  done
+  wait
+  overlap="$(awk '$0=="in"{d++; if(d>m)m=d} $0=="out"{d--} END{print m+0}' "${trace}")"
+  assert_eq '1' "${overlap}" 'at most one holder after a stale-lock reclaim'
+  assert_eq '8' "$(wc -l <"${trace}" | tr -d ' ')" 'every waiter got the lock'
+)
+
+test_reclaim_skips_lock_replaced_by_live_owner() (
+  mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
+  printf '%s\n' "$$" >"${HITSZ_STATE_DIR}/settle.lock/pid"
+  # A waiter that earlier saw a dead owner must not delete the live lock.
+  bridge_settle_reclaim "${HITSZ_STATE_DIR}/settle.lock" 999999 || true
+  [[ -d "${HITSZ_STATE_DIR}/settle.lock" ]] || fail 'reclaim deleted a live lock'
+  rm -rf "${HITSZ_STATE_DIR}/settle.lock"
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -821,6 +851,8 @@ tests=(
   test_foreground_settle_respects_claimed_token
   test_mode_up_claims_before_login_side_effects
   test_overtaken_activation_never_selects_backend
+  test_concurrent_stale_lock_reclaim_is_exclusive
+  test_reclaim_skips_lock_replaced_by_live_owner
 )
 
 for test_name in "${tests[@]}"; do
