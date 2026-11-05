@@ -137,9 +137,13 @@ as soon as that request succeeds and the command returns. The 30-second health
 window and Chromium cleanup then continue in the background
 (`~/.local/state/atrust-surge-bridge/hitsz/settle.log`, override with `BRIDGE_STATE_DIR` or `HITSZ_STATE_DIR`): a route
 regression still rolls Surge back to a verified `DIRECT`, and `hitsz status`
-shows `Settle` while the check runs or after it failed. Each background check
-carries a generation token, and any later activation or `hitsz down` cancels
-it first, so a stale check can never revert a newer connection. Set
+shows `Settle` while the check runs, after it failed, or when it was
+interrupted before recording a result (for example by a restart). Each
+background check carries a generation token, and any later activation or
+`hitsz down` cancels it first, so a stale check can never revert a newer
+connection. `hitsz down` refuses to stop the bridge while another `hitsz`
+command still holds the route, and an `up` whose connection setup fails returns
+a `HITSZ-aTrust` selection to `DIRECT` instead of leaving it unchecked. Set
 `HITSZ_SETTLE_FOREGROUND=1` to keep the old blocking behaviour.
 If the bridge container is already running, `hitsz up` reuses it instead of
 rebuilding the image or recreating the container. On a cold start the image is

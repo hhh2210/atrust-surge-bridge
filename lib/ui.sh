@@ -66,6 +66,8 @@ hitsz_ui_render_status() {
     settle_value="$(gum style --foreground "${HITSZ_UI_YELLOW}" '后台验收中')"
   elif [[ "${HITSZ_STATUS_SETTLE:-}" == "FAILED" ]]; then
     settle_value="$(gum style --foreground "${HITSZ_UI_RED}" "失败 · $(bridge_state_dir)/settle.log")"
+  elif [[ "${HITSZ_STATUS_SETTLE:-}" == "INTERRUPTED" ]]; then
+    settle_value="$(gum style --foreground "${HITSZ_UI_RED}" "中断，验收未完成 · 重新 hitsz up")"
   fi
 
   content="$(

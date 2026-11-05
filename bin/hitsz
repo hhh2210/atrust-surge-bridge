@@ -90,6 +90,7 @@ case "${action}" in
       fi
       if ! hitsz_ui_run_action '1/3 启动隔离 aTrust 并恢复会话…' \
           "${SCRIPT_PATH}" __core_connect; then
+        hitsz_mode_connect_failed
         hitsz_ui_show_vnc_credential "$(vnc_password)"
         hitsz_mode_status
         exit 1

@@ -204,8 +204,22 @@ hitsz_mode_up() {
   if [[ -z "${BRIDGE_SETTLE_TOKEN:-}" ]]; then
     bridge_settle_claim || return 1
   fi
-  hitsz_mode_connect || return 1
+  if ! hitsz_mode_connect; then
+    hitsz_mode_connect_failed
+    return 1
+  fi
   hitsz_mode_finish_dispatch
+}
+
+# The claim stopped any pending settle, which owned the DIRECT rollback for an
+# unhealthy tunnel. A failed connect must not leave Surge on a backend nobody
+# monitors, so fall back to DIRECT under this run's token. A settle is not
+# re-armed instead: its cleanup would close a login the user may still finish.
+hitsz_mode_connect_failed() {
+  [[ "$(hitsz_current_selection)" == "${SITE_SURGE_BACKEND_POLICY}" ]] || return 0
+  printf 'Connection setup failed; returning Surge %s to %s.\n' \
+    "${SITE_SURGE_GROUP}" "${SITE_SURGE_DIRECT_POLICY}" >&2
+  bridge_activation_rollback "${BRIDGE_SETTLE_TOKEN:-}"
 }
 
 hitsz_open_login() {
@@ -221,10 +235,13 @@ hitsz_open_login() {
 }
 
 hitsz_mode_down() {
-  # A settle job only ever writes DIRECT, which is also what down requests,
-  # so a stuck job may not block shutdown.
-  bridge_settle_claim ||
-    printf 'WARNING: continuing shutdown while an old stability check finishes.\n' >&2
+  # The lock also guards an in-flight activation's backend selection; without
+  # the claim it could select the backend after our DIRECT write and leave
+  # Surge on a tunnel we are about to stop.
+  if ! bridge_settle_claim; then
+    printf 'Refusing to stop the bridge while another hitsz command owns the Surge route.\n' >&2
+    return 1
+  fi
   if ! hitsz_restore_direct_route; then
     printf 'Refusing to stop the bridge because HITSZ=DIRECT was not verified.\n' >&2
     return 1

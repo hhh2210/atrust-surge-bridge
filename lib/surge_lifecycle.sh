@@ -173,19 +173,26 @@ bridge_settle_job_alive() {
     ps -p "${pid}" -o command= 2>/dev/null | grep -q '__core_settle_bg'
 }
 
-# mkdir is atomic on every filesystem we target; macOS ships no flock(1).
-# The owner PID lets a later caller reclaim a lock left by a killed process.
+# Creates FILE holding PID only if FILE does not exist yet. Bash noclobber
+# opens with O_CREAT|O_EXCL itself, so exclusivity does not depend on the
+# mkdir(1) implementation: uutils mkdir on Ubuntu 26.04 let several racers
+# "create" the same directory. The owner is written in the same step.
+bridge_settle_create_exclusive() {
+  (set -C && printf '%s\n' "$2" >"$1") 2>/dev/null
+}
+
+# macOS ships no flock(1). The owner PID in the lock file lets a later caller
+# reclaim a lock left by a killed process.
 bridge_settle_lock() {
   local lock owner _
   lock="$(bridge_state_dir)/settle.lock"
   # 60 s covers the slowest guarded side effect: a Chromium stop that may wait
   # 25 s for the in-container browser lock and 20 s for a clean exit.
   for _ in $(seq 1 "${BRIDGE_SETTLE_LOCK_WAIT_TICKS:-600}"); do
-    if mkdir "${lock}" 2>/dev/null; then
-      printf '%s\n' "$$" >"${lock}/pid"
+    if bridge_settle_create_exclusive "${lock}" "$$"; then
       return 0
     fi
-    owner="$(cat "${lock}/pid" 2>/dev/null || true)"
+    owner="$(cat "${lock}" 2>/dev/null || true)"
     if [[ "${owner}" =~ ^[0-9]+$ ]] && ! kill -0 "${owner}" 2>/dev/null &&
       bridge_settle_reclaim "${lock}" "${owner}"; then
       continue
@@ -204,22 +211,21 @@ bridge_settle_lock() {
 bridge_settle_reclaim() {
   local lock="$1" dead_owner="$2" guard guard_owner
   guard="${lock}.reclaim"
-  if ! mkdir "${guard}" 2>/dev/null; then
-    guard_owner="$(cat "${guard}/pid" 2>/dev/null || true)"
+  if ! bridge_settle_create_exclusive "${guard}" "$$"; then
+    guard_owner="$(cat "${guard}" 2>/dev/null || true)"
     if [[ "${guard_owner}" =~ ^[0-9]+$ ]] && ! kill -0 "${guard_owner}" 2>/dev/null; then
-      rm -rf "${guard}"
+      rm -f "${guard}"
     fi
     return 1
   fi
-  printf '%s\n' "$$" >"${guard}/pid"
-  if [[ "$(cat "${lock}/pid" 2>/dev/null || true)" == "${dead_owner}" ]]; then
-    rm -rf "${lock}"
+  if [[ "$(cat "${lock}" 2>/dev/null || true)" == "${dead_owner}" ]]; then
+    rm -f "${lock}"
   fi
-  rm -rf "${guard}"
+  rm -f "${guard}"
 }
 
 bridge_settle_unlock() {
-  rm -rf "$(bridge_state_dir)/settle.lock"
+  rm -f "$(bridge_state_dir)/settle.lock"
 }
 
 # uuidgen ships with macOS but not with every Linux base image.
@@ -281,17 +287,26 @@ bridge_settle_claim() {
     pid="$(cat "${dir}/settle.pid")"
     kill "${pid}" 2>/dev/null || true
   fi
-  rm -f "${dir}/settle.pid"
+  # The new owner supersedes the old job's result as well as the job.
+  rm -f "${dir}/settle.pid" "${dir}/settle.state"
   bridge_settle_unlock
   export BRIDGE_SETTLE_TOKEN="${token}"
 }
 
-# Prints RUNNING or FAILED when a background settle needs attention.
+# Prints RUNNING, FAILED or INTERRUPTED when a background settle needs
+# attention. INTERRUPTED: the job died (e.g. host restart) before recording a
+# result, so its rollback and cleanup may never have run. The grace period
+# covers the moment between dispatch recording `running` and the job starting.
 bridge_settle_status() {
+  local state="" since=""
+  { read -r state since <"$(bridge_state_dir)/settle.state"; } 2>/dev/null || true
   if bridge_settle_job_alive; then
     printf 'RUNNING\n'
-  elif [[ "$(cut -d' ' -f1 "$(bridge_state_dir)/settle.state" 2>/dev/null)" == "failed" ]]; then
+  elif [[ "${state}" == "failed" ]]; then
     printf 'FAILED\n'
+  elif [[ "${state}" == "running" && "${since}" =~ ^[0-9]+$ ]] &&
+    (($(date +%s) - since > ${BRIDGE_SETTLE_START_GRACE_SECONDS:-10})); then
+    printf 'INTERRUPTED\n'
   fi
 }
 

@@ -657,7 +657,7 @@ test_cancel_waits_for_inflight_rollback() (
   printf 'activate\n' >>"${trace}"
   wait "${bg}" || true
   assert_eq $'direct\nactivate' "$(cat "${trace}")" 'cancel waits for in-flight rollback'
-  [[ ! -d "${HITSZ_STATE_DIR}/settle.lock" ]] || fail 'settle lock must be released'
+  [[ ! -e "${HITSZ_STATE_DIR}/settle.lock" ]] || fail 'settle lock must be released'
 )
 
 test_superseded_exclusive_skips_side_effect() (
@@ -669,8 +669,7 @@ test_superseded_exclusive_skips_side_effect() (
 )
 
 test_stale_settle_lock_is_reclaimed() (
-  mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
-  printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock/pid"
+  printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock"
   export BRIDGE_SETTLE_LOCK_WAIT_TICKS=5
   bridge_settle_lock || fail 'a lock owned by a dead PID must be reclaimed'
   bridge_settle_unlock
@@ -684,8 +683,7 @@ test_cancel_timeout_blocks_new_activation() (
   trap 'kill "${holder}" 2>/dev/null; rm -f "${trace}"' EXIT
 
   printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
-  mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
-  printf '%s\n' "${holder}" >"${HITSZ_STATE_DIR}/settle.lock/pid"
+  printf '%s\n' "${holder}" >"${HITSZ_STATE_DIR}/settle.lock"
   export BRIDGE_SETTLE_LOCK_WAIT_TICKS=2
   bridge_surge_activate() { printf 'activate\n' >>"${trace}"; }
 
@@ -694,7 +692,7 @@ test_cancel_timeout_blocks_new_activation() (
   fi
   assert_eq '' "$(cat "${trace}")" 'no activation behind a live settle lock'
   assert_eq 'gen-1' "$(cat "${HITSZ_STATE_DIR}/settle.generation")" 'old generation kept'
-  rm -rf "${HITSZ_STATE_DIR}/settle.lock"
+  rm -f "${HITSZ_STATE_DIR}/settle.lock"
 )
 
 test_late_dispatch_from_older_activation_backs_off() (
@@ -778,43 +776,34 @@ test_overtaken_activation_never_selects_backend() (
 )
 
 test_concurrent_stale_lock_reclaim_is_exclusive() (
-  local trace xdir i f overlap
+  local trace i overlap
   trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
-  xdir="$(mktemp -d -t hitsz-test-xtrace.XXXXXX)"
-  trap 'rm -f "${trace}"; rm -rf "${xdir}"' EXIT
+  trap 'rm -f "${trace}"' EXIT
 
-  mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
-  printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock/pid"
+  # uutils mkdir (Ubuntu 26.04) reported success to several racers creating
+  # the same directory; the lock must not depend on mkdir at all.
+  mkdir() { command mkdir -p "$@" 2>/dev/null || true; }
+  printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock"
   critical() {
-    # shellcheck disable=SC2012 # inode of a fixed path, portable to BSD and GNU
-    printf 'in %s inode=%s\n' "$1" "$(ls -id "${HITSZ_STATE_DIR}/settle.lock" 2>/dev/null | awk '{print $1}')" >>"${trace}"
+    printf 'in %s\n' "$1" >>"${trace}"
     command sleep 0.15
     printf 'out %s\n' "$1" >>"${trace}"
   }
   for i in 1 2 3 4; do
-    (
-      # TEMP diagnostics for the Linux CI overlap: per-waiter timed xtrace.
-      if ((BASH_VERSINFO[0] >= 5)); then
-        exec 9>"${xdir}/w${i}"
-        BASH_XTRACEFD=9
-        # shellcheck disable=SC2016 # expanded by xtrace at run time
-        PS4='+ ${EPOCHREALTIME} ${BASHPID} '
-        set -x
-      fi
-      bridge_settle_lock && { critical "${i}"; bridge_settle_unlock; }
-    ) &
+    ( bridge_settle_lock && { critical "${i}"; bridge_settle_unlock; } ) &
   done
   wait
   overlap="$(awk '$1=="in"{d++; if(d>m)m=d} $1=="out"{d--} END{print m+0}' "${trace}")"
-  if [[ "${overlap}" != '1' ]]; then
-    cat "${trace}" >&2
-    for f in "${xdir}"/w*; do
-      printf '== %s\n' "${f##*/}" >&2
-      grep -v 'seq 1\|^+* *[0-9.]* [0-9]* local ' "${f}" | head -60 >&2
-    done
-  fi
   assert_eq '1' "${overlap}" 'at most one holder after a stale-lock reclaim'
   assert_eq '8' "$(wc -l <"${trace}" | tr -d ' ')" 'every waiter got the lock'
+)
+
+test_reclaim_skips_lock_replaced_by_live_owner() (
+  printf '%s\n' "$$" >"${HITSZ_STATE_DIR}/settle.lock"
+  # A waiter that earlier saw a dead owner must not delete the live lock.
+  bridge_settle_reclaim "${HITSZ_STATE_DIR}/settle.lock" 999999 || true
+  [[ -e "${HITSZ_STATE_DIR}/settle.lock" ]] || fail 'reclaim deleted a live lock'
+  rm -f "${HITSZ_STATE_DIR}/settle.lock"
 )
 
 test_claim_without_uuidgen_still_locks() (
@@ -830,13 +819,58 @@ test_claim_without_uuidgen_still_locks() (
     'generation without uuidgen'
 )
 
-test_reclaim_skips_lock_replaced_by_live_owner() (
-  mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
-  printf '%s\n' "$$" >"${HITSZ_STATE_DIR}/settle.lock/pid"
-  # A waiter that earlier saw a dead owner must not delete the live lock.
-  bridge_settle_reclaim "${HITSZ_STATE_DIR}/settle.lock" 999999 || true
-  [[ -d "${HITSZ_STATE_DIR}/settle.lock" ]] || fail 'reclaim deleted a live lock'
-  rm -rf "${HITSZ_STATE_DIR}/settle.lock"
+test_down_aborts_when_route_claim_fails() (
+  local trace fake
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  fake="$(mktemp -d -t hitsz-test-root.XXXXXX)"
+  trap 'rm -f "${trace}"; rm -rf "${fake}"' EXIT
+  # Never reach the real bin/down, even if the guard regresses.
+  mkdir -p "${fake}/bin"
+  printf '#!/bin/sh\necho stop >>"%s"\n' "${trace}" >"${fake}/bin/down"
+  chmod +x "${fake}/bin/down"
+  ROOT_DIR="${fake}"
+
+  bridge_settle_claim() { return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+  hitsz_retest_group() { :; }
+  bridge_site_http_probe() { return 1; }
+
+  if hitsz_mode_down >/dev/null 2>&1; then
+    fail 'down must stop when another command owns the route'
+  fi
+  assert_eq '' "$(cat "${trace}")" 'no DIRECT write or shutdown without the claim'
+)
+
+test_failed_connect_returns_backend_route_to_direct() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  hitsz_mode_connect() { return 1; }
+  bridge_surge_current_selection() { printf 'HITSZ-aTrust\n'; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+
+  if hitsz_mode_up >/dev/null 2>&1; then
+    fail 'up must fail when connect fails'
+  fi
+  assert_eq 'direct' "$(cat "${trace}")" 'unmonitored backend route reverted'
+
+  : >"${trace}"
+  unset BRIDGE_SETTLE_TOKEN
+  bridge_surge_current_selection() { printf 'DIRECT\n'; }
+  hitsz_mode_up >/dev/null 2>&1 || true
+  assert_eq '' "$(cat "${trace}")" 'DIRECT route left alone'
+)
+
+test_status_reports_interrupted_settle() (
+  bridge_settle_job_alive() { return 1; }
+  printf 'running %s\n' "$(($(date +%s) - 60))" >"${HITSZ_STATE_DIR}/settle.state"
+  assert_eq 'INTERRUPTED' "$(bridge_settle_status)" 'dead job left running state'
+  printf 'running %s\n' "$(date +%s)" >"${HITSZ_STATE_DIR}/settle.state"
+  assert_eq '' "$(bridge_settle_status)" 'job still starting'
+  printf 'running 0\n' >"${HITSZ_STATE_DIR}/settle.state"
+  bridge_settle_claim
+  assert_eq '' "$(bridge_settle_status)" 'claim clears the superseded result'
 )
 
 tests=(
@@ -886,6 +920,9 @@ tests=(
   test_concurrent_stale_lock_reclaim_is_exclusive
   test_claim_without_uuidgen_still_locks
   test_reclaim_skips_lock_replaced_by_live_owner
+  test_down_aborts_when_route_claim_fails
+  test_failed_connect_returns_backend_route_to_direct
+  test_status_reports_interrupted_settle
 )
 
 for test_name in "${tests[@]}"; do
