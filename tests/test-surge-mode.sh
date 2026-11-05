@@ -683,7 +683,7 @@ test_cancel_timeout_blocks_new_activation() (
   trap 'kill "${holder}" 2>/dev/null; rm -f "${trace}"' EXIT
 
   printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
-  printf '%s\n' "${holder}" >"${HITSZ_STATE_DIR}/settle.lock"
+  bridge_settle_identity "${holder}" >"${HITSZ_STATE_DIR}/settle.lock"
   export BRIDGE_SETTLE_LOCK_WAIT_TICKS=2
   bridge_surge_activate() { printf 'activate\n' >>"${trace}"; }
 
@@ -873,6 +873,40 @@ test_status_reports_interrupted_settle() (
   assert_eq '' "$(bridge_settle_status)" 'claim clears the superseded result'
 )
 
+test_down_backs_off_when_superseded_before_shutdown() (
+  local trace fake
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  fake="$(mktemp -d -t hitsz-test-root.XXXXXX)"
+  trap 'rm -f "${trace}"; rm -rf "${fake}"' EXIT
+  mkdir -p "${fake}/bin"
+  printf '#!/bin/sh\necho stop >>"%s"\n' "${trace}" >"${fake}/bin/down"
+  chmod +x "${fake}/bin/down"
+  ROOT_DIR="${fake}"
+
+  # A newer `up` claims right after this down's DIRECT write.
+  bridge_surge_restore_direct() {
+    printf 'direct\n' >>"${trace}"
+    printf 'newer\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  }
+  hitsz_retest_group() { :; }
+  bridge_site_http_probe() { return 1; }
+
+  if hitsz_mode_down >/dev/null 2>&1; then
+    fail 'an overtaken down must not report success'
+  fi
+  assert_eq 'direct' "$(cat "${trace}")" 'overtaken down must not stop the VM'
+)
+
+test_reused_lock_pid_is_reclaimed() (
+  # After a reboot the dead owner's PID may belong to an unrelated process.
+  printf '%s Thu Jan  1 00:00:00 1970\n' "$$" >"${HITSZ_STATE_DIR}/settle.lock"
+  export BRIDGE_SETTLE_LOCK_WAIT_TICKS=5
+  bridge_settle_lock || fail 'a lock whose PID was reused must be reclaimed'
+  assert_eq "$(bridge_settle_identity "$$")" "$(cat "${HITSZ_STATE_DIR}/settle.lock")" \
+    'reclaimed lock owner'
+  bridge_settle_unlock
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -923,6 +957,8 @@ tests=(
   test_down_aborts_when_route_claim_fails
   test_failed_connect_returns_backend_route_to_direct
   test_status_reports_interrupted_settle
+  test_down_backs_off_when_superseded_before_shutdown
+  test_reused_lock_pid_is_reclaimed
 )
 
 for test_name in "${tests[@]}"; do

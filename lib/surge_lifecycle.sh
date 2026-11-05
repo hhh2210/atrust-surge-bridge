@@ -173,27 +173,53 @@ bridge_settle_job_alive() {
     ps -p "${pid}" -o command= 2>/dev/null | grep -q '__core_settle_bg'
 }
 
-# Creates FILE holding PID only if FILE does not exist yet. Bash noclobber
-# opens with O_CREAT|O_EXCL itself, so exclusivity does not depend on the
-# mkdir(1) implementation: uutils mkdir on Ubuntu 26.04 let several racers
-# "create" the same directory. The owner is written in the same step.
+# Creates FILE holding the caller's identity only if FILE does not exist yet.
+# Bash noclobber opens with O_CREAT|O_EXCL itself, so exclusivity does not
+# depend on the mkdir(1) implementation: uutils mkdir on Ubuntu 26.04 let
+# several racers "create" the same directory.
 bridge_settle_create_exclusive() {
   (set -C && printf '%s\n' "$2" >"$1") 2>/dev/null
 }
 
-# macOS ships no flock(1). The owner PID in the lock file lets a later caller
-# reclaim a lock left by a killed process.
+# PID plus process start time, so a PID reused after a crash or reboot is not
+# mistaken for the original owner.
+bridge_settle_identity() {
+  local started
+  started="$(ps -p "$1" -o lstart= 2>/dev/null || true)"
+  started="${started#"${started%%[![:space:]]*}"}"
+  started="${started%"${started##*[![:space:]]}"}"
+  printf '%s %s\n' "$1" "${started}"
+}
+
+# Succeeds when OWNER (an identity line from a lock file) is provably dead:
+# its PID is gone, or now belongs to a process that started at another time.
+# An empty or malformed owner is a lock still being written, never dead.
+bridge_settle_owner_dead() {
+  local owner="$1" pid started
+  pid="${owner%% *}"
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 0
+  started="${owner#"${pid}"}"
+  started="${started# }"
+  [[ -n "${started}" ]] || return 1
+  [[ "$(bridge_settle_identity "${pid}")" != "${owner}" ]]
+}
+
+# macOS ships no flock(1). The owner identity in the lock file lets a later
+# caller reclaim a lock left by a killed process.
 bridge_settle_lock() {
-  local lock owner _
+  local lock owner self _
   lock="$(bridge_state_dir)/settle.lock"
-  # 60 s covers the slowest guarded side effect: a Chromium stop that may wait
-  # 25 s for the in-container browser lock and 20 s for a clean exit.
+  self="$(bridge_settle_identity "$$")"
+  # 60 s covers the slowest guarded side effect: `bin/down` (a 25 s compose
+  # timeout plus the VM stop) or a Chromium stop that may wait 25 s for the
+  # in-container browser lock and 20 s for a clean exit.
   for _ in $(seq 1 "${BRIDGE_SETTLE_LOCK_WAIT_TICKS:-600}"); do
-    if bridge_settle_create_exclusive "${lock}" "$$"; then
+    if bridge_settle_create_exclusive "${lock}" "${self}"; then
       return 0
     fi
     owner="$(cat "${lock}" 2>/dev/null || true)"
-    if [[ "${owner}" =~ ^[0-9]+$ ]] && ! kill -0 "${owner}" 2>/dev/null &&
+    if bridge_settle_owner_dead "${owner}" &&
       bridge_settle_reclaim "${lock}" "${owner}"; then
       continue
     fi
@@ -205,15 +231,14 @@ bridge_settle_lock() {
 
 # Only the waiter holding the reclaim guard may delete a dead owner's lock,
 # and it re-reads the owner under the guard, so a second waiter that saw the
-# same dead PID cannot delete the fresh lock the first one just created.
+# same dead owner cannot delete the fresh lock the first one just created.
 # Nobody else can replace the lock meanwhile: it only disappears through this
 # guarded removal, and its dead owner will never unlock it.
 bridge_settle_reclaim() {
-  local lock="$1" dead_owner="$2" guard guard_owner
+  local lock="$1" dead_owner="$2" guard
   guard="${lock}.reclaim"
-  if ! bridge_settle_create_exclusive "${guard}" "$$"; then
-    guard_owner="$(cat "${guard}" 2>/dev/null || true)"
-    if [[ "${guard_owner}" =~ ^[0-9]+$ ]] && ! kill -0 "${guard_owner}" 2>/dev/null; then
+  if ! bridge_settle_create_exclusive "${guard}" "$(bridge_settle_identity "$$")"; then
+    if bridge_settle_owner_dead "$(cat "${guard}" 2>/dev/null || true)"; then
       rm -f "${guard}"
     fi
     return 1

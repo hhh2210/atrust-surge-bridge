@@ -234,7 +234,12 @@ hitsz_open_login() {
   open "$(novnc_autologin_url)"
 }
 
+hitsz_mode_down_superseded() {
+  printf 'A newer hitsz command took over the route; leaving the bridge running.\n' >&2
+}
+
 hitsz_mode_down() {
+  local rc=0
   # The lock also guards an in-flight activation's backend selection; without
   # the claim it could select the backend after our DIRECT write and leave
   # Surge on a tunnel we are about to stop.
@@ -242,11 +247,23 @@ hitsz_mode_down() {
     printf 'Refusing to stop the bridge while another hitsz command owns the Surge route.\n' >&2
     return 1
   fi
-  if ! hitsz_restore_direct_route; then
+  # Keep ownership through the shutdown: both steps run under the lock and only
+  # while this generation is current, so a newer `up` either waits for the VM
+  # to stop or makes this `down` back off before it stops a live tunnel.
+  bridge_settle_exclusive "${BRIDGE_SETTLE_TOKEN}" hitsz_restore_direct_route || rc=$?
+  if [[ "${rc}" -eq 3 ]]; then
+    hitsz_mode_down_superseded
+    return 1
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
     printf 'Refusing to stop the bridge because HITSZ=DIRECT was not verified.\n' >&2
     return 1
   fi
-  "${ROOT_DIR}/bin/down"
+  bridge_settle_exclusive "${BRIDGE_SETTLE_TOKEN}" "${ROOT_DIR}/bin/down" || rc=$?
+  if [[ "${rc}" -eq 3 ]]; then
+    hitsz_mode_down_superseded
+    return 1
+  fi
   hitsz_retest_group || true
   if hitsz_normal_jw_probe; then
     printf 'HITSZ direct access is available on the current network.\n'
