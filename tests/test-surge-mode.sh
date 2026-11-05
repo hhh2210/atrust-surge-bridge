@@ -736,6 +736,24 @@ test_foreground_settle_respects_claimed_token() (
   assert_eq '' "$(cat "${trace}")" 'superseded foreground settle side effects'
 )
 
+test_mode_up_claims_before_login_side_effects() (
+  local trace expected
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  bridge_settle_claim() {
+    printf 'claim\n' >>"${trace}"
+    export BRIDGE_SETTLE_TOKEN=t1
+  }
+  hitsz_mode_connect() { printf 'connect\n' >>"${trace}"; }
+  bridge_surge_activate() { printf 'activate\n' >>"${trace}"; }
+  hitsz_settle_dispatch() { printf 'dispatch\n' >>"${trace}"; }
+
+  hitsz_mode_up >/dev/null
+  expected=$'claim\nconnect\nactivate\ndispatch'
+  assert_eq "${expected}" "$(cat "${trace}")" 'claim precedes login and is not repeated'
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -778,6 +796,7 @@ tests=(
   test_cancel_timeout_blocks_new_activation
   test_late_dispatch_from_older_activation_backs_off
   test_foreground_settle_respects_claimed_token
+  test_mode_up_claims_before_login_side_effects
 )
 
 for test_name in "${tests[@]}"; do

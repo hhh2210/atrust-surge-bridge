@@ -200,6 +200,10 @@ hitsz_mode_finish_dispatch() {
 }
 
 hitsz_mode_up() {
+  # Claim before the login flow can open a browser an old settle might close.
+  if [[ -z "${BRIDGE_SETTLE_TOKEN:-}" ]]; then
+    bridge_settle_claim || return 1
+  fi
   hitsz_mode_connect || return 1
   hitsz_mode_finish_dispatch
 }
