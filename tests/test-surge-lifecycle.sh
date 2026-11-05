@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2329 # Mocks are invoked indirectly via bridge_settle_exclusive "$@".
 set -euo pipefail
 
 TEST_ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"

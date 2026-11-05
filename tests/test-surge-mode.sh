@@ -754,6 +754,29 @@ test_mode_up_claims_before_login_side_effects() (
   assert_eq "${expected}" "$(cat "${trace}")" 'claim precedes login and is not repeated'
 )
 
+test_overtaken_activation_never_selects_backend() (
+  local trace token_a
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  bridge_backend_ready() { return 0; }
+  bridge_backend_wait_ready() { return 0; }
+  bridge_backend_prepare_proxy() { return 0; }
+  bridge_surge_select_backend() { printf 'backend\n' >>"${trace}"; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+  bridge_surge_current_selection() { printf 'HITSZ-aTrust\n'; }
+  bridge_site_http_probe() { return 0; }
+
+  # up A claims, then down B claims before A reaches the Surge write.
+  bridge_settle_claim
+  token_a="${BRIDGE_SETTLE_TOKEN}"
+  ( bridge_settle_claim )
+  if BRIDGE_SETTLE_TOKEN="${token_a}" hitsz_mode_activate_route >/dev/null 2>&1; then
+    fail 'an overtaken activation must fail'
+  fi
+  assert_eq '' "$(cat "${trace}")" 'overtaken activation must not touch Surge'
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -797,6 +820,7 @@ tests=(
   test_late_dispatch_from_older_activation_backs_off
   test_foreground_settle_respects_claimed_token
   test_mode_up_claims_before_login_side_effects
+  test_overtaken_activation_never_selects_backend
 )
 
 for test_name in "${tests[@]}"; do

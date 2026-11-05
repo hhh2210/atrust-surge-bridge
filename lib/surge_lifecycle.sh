@@ -102,35 +102,49 @@ bridge_wait_for_stable_route() {
   return 1
 }
 
+# TOKEN (optional) is the generation this activation claimed. Every Surge
+# write runs under the settle lock and only while TOKEN is current, so an
+# activation overtaken by a newer up or a down neither selects the backend
+# nor rolls the newer owner back to DIRECT.
+bridge_activation_rollback() {
+  bridge_settle_exclusive "$1" bridge_surge_restore_direct || true
+}
+
 bridge_surge_activate() {
-  local selection
+  local token="${1:-}" selection rc=0
   bridge_require_callbacks bridge_backend_ready bridge_backend_wait_ready \
     bridge_backend_prepare_proxy || return 1
   if ! bridge_backend_ready; then
     if ! bridge_backend_wait_ready 0; then
-      bridge_surge_restore_direct || true
+      bridge_activation_rollback "${token}"
       return 1
     fi
   fi
   if ! bridge_backend_prepare_proxy; then
-    bridge_surge_restore_direct || true
+    bridge_activation_rollback "${token}"
     return 1
   fi
-  if ! bridge_surge_select_backend; then
-    bridge_surge_restore_direct || true
+  bridge_settle_exclusive "${token}" bridge_surge_select_backend || rc=$?
+  if [[ "${rc}" -eq 3 ]]; then
+    printf 'A newer %s command took over; leaving the Surge %s selection alone.\n' \
+      "${SITE_LABEL}" "${SITE_SURGE_GROUP}" >&2
+    return 1
+  fi
+  if [[ "${rc}" -ne 0 ]]; then
+    bridge_activation_rollback "${token}"
     printf 'Failed to select the Surge %s policy.\n' \
       "${SITE_SURGE_BACKEND_POLICY}" >&2
     return 1
   fi
   selection="$(bridge_surge_current_selection)"
   if [[ "${selection}" != "${SITE_SURGE_BACKEND_POLICY}" ]]; then
-    bridge_surge_restore_direct || true
+    bridge_activation_rollback "${token}"
     printf 'Surge %s activation was not verified; live selection is %s.\n' \
       "${SITE_SURGE_GROUP}" "${selection}" >&2
     return 1
   fi
   if ! bridge_site_http_probe; then
-    bridge_surge_restore_direct || true
+    bridge_activation_rollback "${token}"
     printf '%s SOCKS is ready, but the Surge %s route still failed.\n' \
       "${SITE_BACKEND_LABEL}" "${SITE_SURGE_GROUP}" >&2
     return 1

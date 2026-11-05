@@ -178,7 +178,7 @@ hitsz_mode_activate_route() {
   if [[ -z "${BRIDGE_SETTLE_TOKEN:-}" ]]; then
     bridge_settle_claim || return 1
   fi
-  bridge_surge_activate
+  bridge_surge_activate "${BRIDGE_SETTLE_TOKEN}"
 }
 # Foreground settles (plain mode, __core_settle, HITSZ_SETTLE_FOREGROUND=1)
 # carry the claimed token too, so a newer activation still supersedes them.
