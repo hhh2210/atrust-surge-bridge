@@ -785,15 +785,16 @@ test_concurrent_stale_lock_reclaim_is_exclusive() (
   mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
   printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock/pid"
   critical() {
-    printf 'in\n' >>"${trace}"
+    printf 'in %s %s\n' "$1" "$(cat "${HITSZ_STATE_DIR}/settle.lock/pid" 2>/dev/null)" >>"${trace}"
     command sleep 0.15
-    printf 'out\n' >>"${trace}"
+    printf 'out %s\n' "$1" >>"${trace}"
   }
   for i in 1 2 3 4; do
-    ( bridge_settle_lock && { critical; bridge_settle_unlock; } ) &
+    ( bridge_settle_lock && { critical "${i}"; bridge_settle_unlock; } ) &
   done
   wait
-  overlap="$(awk '$0=="in"{d++; if(d>m)m=d} $0=="out"{d--} END{print m+0}' "${trace}")"
+  overlap="$(awk '$1=="in"{d++; if(d>m)m=d} $1=="out"{d--} END{print m+0}' "${trace}")"
+  [[ "${overlap}" == '1' ]] || cat "${trace}" >&2
   assert_eq '1' "${overlap}" 'at most one holder after a stale-lock reclaim'
   assert_eq '8' "$(wc -l <"${trace}" | tr -d ' ')" 'every waiter got the lock'
 )
