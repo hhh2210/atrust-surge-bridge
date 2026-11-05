@@ -164,7 +164,9 @@ bridge_settle_job_alive() {
 bridge_settle_lock() {
   local lock owner _
   lock="$(bridge_state_dir)/settle.lock"
-  for _ in $(seq 1 "${BRIDGE_SETTLE_LOCK_WAIT_TICKS:-400}"); do
+  # 60 s covers the slowest guarded side effect: a Chromium stop that may wait
+  # 25 s for the in-container browser lock and 20 s for a clean exit.
+  for _ in $(seq 1 "${BRIDGE_SETTLE_LOCK_WAIT_TICKS:-600}"); do
     if mkdir "${lock}" 2>/dev/null; then
       printf '%s\n' "$$" >"${lock}/pid"
       return 0
@@ -206,14 +208,18 @@ bridge_settle_exclusive() {
 
 # Waits for any in-flight background side effect (via the lock) before
 # invalidating the generation, so killing the job afterwards cannot leave an
-# orphaned surge-cli/docker child that later overwrites a newer route.
+# orphaned surge-cli/docker child that later overwrites a newer route. Fails
+# closed: without the lock the old job keeps ownership and nothing is killed.
 bridge_settle_cancel() {
-  local dir pid locked=0
+  local dir pid
   dir="$(bridge_state_dir)"
   [[ -d "${dir}" ]] || return 0
-  bridge_settle_lock && locked=1
+  if ! bridge_settle_lock; then
+    printf 'A previous stability check is still changing Surge; retry shortly.\n' >&2
+    return 1
+  fi
   printf 'cancelled\n' >"${dir}/settle.generation" 2>/dev/null || true
-  [[ "${locked}" -eq 0 ]] || bridge_settle_unlock
+  bridge_settle_unlock
   if bridge_settle_job_alive; then
     pid="$(cat "${dir}/settle.pid")"
     kill "${pid}" 2>/dev/null || true

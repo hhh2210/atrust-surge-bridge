@@ -173,7 +173,7 @@ bridge_backend_cleanup() {
 
 # A newer activation supersedes any background settle before touching Surge.
 hitsz_mode_activate_route() {
-  bridge_settle_cancel
+  bridge_settle_cancel || return 1
   bridge_surge_activate
 }
 hitsz_mode_settle() { bridge_surge_settle; }
@@ -211,7 +211,10 @@ hitsz_open_login() {
 }
 
 hitsz_mode_down() {
-  bridge_settle_cancel
+  # A settle job only ever writes DIRECT, which is also what down requests,
+  # so a stuck job may not block shutdown.
+  bridge_settle_cancel ||
+    printf 'WARNING: continuing shutdown while an old stability check finishes.\n' >&2
   if ! hitsz_restore_direct_route; then
     printf 'Refusing to stop the bridge because HITSZ=DIRECT was not verified.\n' >&2
     return 1

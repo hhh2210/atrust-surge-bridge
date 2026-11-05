@@ -1,5 +1,5 @@
 #!/bin/bash
-# shellcheck disable=SC2317,SC2329 # Mock functions are called indirectly by sourced code.
+# shellcheck disable=SC2317,SC2329,SC2030,SC2031 # Mocks are called indirectly; each test is an isolated subshell.
 set -euo pipefail
 
 TEST_ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -675,6 +675,27 @@ test_stale_settle_lock_is_reclaimed() (
   bridge_settle_unlock
 )
 
+test_cancel_timeout_blocks_new_activation() (
+  local holder trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  command sleep 30 &
+  holder=$!
+  trap 'kill "${holder}" 2>/dev/null; rm -f "${trace}"' EXIT
+
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
+  printf '%s\n' "${holder}" >"${HITSZ_STATE_DIR}/settle.lock/pid"
+  export BRIDGE_SETTLE_LOCK_WAIT_TICKS=2
+  bridge_surge_activate() { printf 'activate\n' >>"${trace}"; }
+
+  if hitsz_mode_activate_route >/dev/null 2>&1; then
+    fail 'activation must fail while an old side effect still holds the lock'
+  fi
+  assert_eq '' "$(cat "${trace}")" 'no activation behind a live settle lock'
+  assert_eq 'gen-1' "$(cat "${HITSZ_STATE_DIR}/settle.generation")" 'old generation kept'
+  rm -rf "${HITSZ_STATE_DIR}/settle.lock"
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -714,6 +735,7 @@ tests=(
   test_cancel_waits_for_inflight_rollback
   test_superseded_exclusive_skips_side_effect
   test_stale_settle_lock_is_reclaimed
+  test_cancel_timeout_blocks_new_activation
 )
 
 for test_name in "${tests[@]}"; do
