@@ -180,7 +180,9 @@ hitsz_mode_activate_route() {
   fi
   bridge_surge_activate
 }
-hitsz_mode_settle() { bridge_surge_settle; }
+# Foreground settles (plain mode, __core_settle, HITSZ_SETTLE_FOREGROUND=1)
+# carry the claimed token too, so a newer activation still supersedes them.
+hitsz_mode_settle() { bridge_surge_settle "${BRIDGE_SETTLE_TOKEN:-}"; }
 hitsz_mode_settle_bg() { bridge_settle_run_bg "$@"; }
 
 hitsz_settle_dispatch() {

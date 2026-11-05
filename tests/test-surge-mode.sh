@@ -720,6 +720,22 @@ test_late_dispatch_from_older_activation_backs_off() (
     'only the newest activation launches a settle'
 )
 
+test_foreground_settle_respects_claimed_token() (
+  local trace
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  bridge_settle_claim
+  # A newer activation claims the route while this foreground check runs.
+  ( bridge_settle_claim )
+  bridge_wait_for_stable_route() { return 1; }
+  bridge_surge_restore_direct() { printf 'direct\n' >>"${trace}"; }
+  bridge_backend_cleanup() { printf 'trim\n' >>"${trace}"; }
+
+  hitsz_mode_settle >/dev/null 2>&1 || fail 'superseded foreground settle must exit quietly'
+  assert_eq '' "$(cat "${trace}")" 'superseded foreground settle side effects'
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -761,6 +777,7 @@ tests=(
   test_stale_settle_lock_is_reclaimed
   test_cancel_timeout_blocks_new_activation
   test_late_dispatch_from_older_activation_backs_off
+  test_foreground_settle_respects_claimed_token
 )
 
 for test_name in "${tests[@]}"; do
