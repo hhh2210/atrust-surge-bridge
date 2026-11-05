@@ -778,28 +778,40 @@ test_overtaken_activation_never_selects_backend() (
 )
 
 test_concurrent_stale_lock_reclaim_is_exclusive() (
-  local trace i overlap
+  local trace xdir i f overlap
   trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
-  trap 'rm -f "${trace}"' EXIT
+  xdir="$(mktemp -d -t hitsz-test-xtrace.XXXXXX)"
+  trap 'rm -f "${trace}"; rm -rf "${xdir}"' EXIT
 
   mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
   printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock/pid"
   critical() {
-    printf 'in %s %s\n' "$1" "$(cat "${HITSZ_STATE_DIR}/settle.lock/pid" 2>/dev/null)" >>"${trace}"
+    # shellcheck disable=SC2012 # inode of a fixed path, portable to BSD and GNU
+    printf 'in %s inode=%s\n' "$1" "$(ls -id "${HITSZ_STATE_DIR}/settle.lock" 2>/dev/null | awk '{print $1}')" >>"${trace}"
     command sleep 0.15
     printf 'out %s\n' "$1" >>"${trace}"
   }
   for i in 1 2 3 4; do
-    ( bridge_settle_lock && { critical "${i}"; bridge_settle_unlock; } ) &
+    (
+      # TEMP diagnostics for the Linux CI overlap: per-waiter timed xtrace.
+      if ((BASH_VERSINFO[0] >= 5)); then
+        exec 9>"${xdir}/w${i}"
+        BASH_XTRACEFD=9
+        # shellcheck disable=SC2016 # expanded by xtrace at run time
+        PS4='+ ${EPOCHREALTIME} ${BASHPID} '
+        set -x
+      fi
+      bridge_settle_lock && { critical "${i}"; bridge_settle_unlock; }
+    ) &
   done
   wait
   overlap="$(awk '$1=="in"{d++; if(d>m)m=d} $1=="out"{d--} END{print m+0}' "${trace}")"
   if [[ "${overlap}" != '1' ]]; then
     cat "${trace}" >&2
-    # Diagnose: does kill -0 see this live test process from a waiter?
-    ( kill -0 "$$"; printf 'kill -0 $$=%s rc=%s\n' "$$" "$?" >&2 ) 2>&1
-    ( out="$(kill -0 "$$" 2>&1)"; printf 'stderr=[%s] type=%s\n' "${out}" "$(type -t kill)" >&2 )
-    ls -la "${HITSZ_STATE_DIR}" >&2
+    for f in "${xdir}"/w*; do
+      printf '== %s\n' "${f##*/}" >&2
+      grep -v 'seq 1\|^+* *[0-9.]* [0-9]* local ' "${f}" | head -60 >&2
+    done
   fi
   assert_eq '1' "${overlap}" 'at most one holder after a stale-lock reclaim'
   assert_eq '8' "$(wc -l <"${trace}" | tr -d ' ')" 'every waiter got the lock'
