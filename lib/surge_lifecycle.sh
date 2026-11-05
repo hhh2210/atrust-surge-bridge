@@ -159,11 +159,61 @@ bridge_settle_job_alive() {
     ps -p "${pid}" -o command= 2>/dev/null | grep -q '__core_settle_bg'
 }
 
+# mkdir is atomic on every filesystem we target; macOS ships no flock(1).
+# The owner PID lets a later caller reclaim a lock left by a killed process.
+bridge_settle_lock() {
+  local lock owner _
+  lock="$(bridge_state_dir)/settle.lock"
+  for _ in $(seq 1 "${BRIDGE_SETTLE_LOCK_WAIT_TICKS:-400}"); do
+    if mkdir "${lock}" 2>/dev/null; then
+      printf '%s\n' "$$" >"${lock}/pid"
+      return 0
+    fi
+    owner="$(cat "${lock}/pid" 2>/dev/null || true)"
+    if [[ "${owner}" =~ ^[0-9]+$ ]] && ! kill -0 "${owner}" 2>/dev/null; then
+      rm -rf "${lock}"
+      continue
+    fi
+    sleep 0.1
+  done
+  printf 'Timed out waiting for the settle lock.\n' >&2
+  return 1
+}
+
+bridge_settle_unlock() {
+  rm -rf "$(bridge_state_dir)/settle.lock"
+}
+
+# Run "$@" only while TOKEN is current, holding the settle lock across both
+# the generation check and the side effect so a cancel cannot slip between
+# them. Returns 3 without running anything when the token is superseded.
+bridge_settle_exclusive() {
+  local token="$1" rc=0
+  shift
+  if [[ -z "${token}" ]]; then
+    "$@"
+    return
+  fi
+  bridge_settle_lock || return 1
+  if bridge_settle_superseded "${token}"; then
+    bridge_settle_unlock
+    return 3
+  fi
+  "$@" || rc=$?
+  bridge_settle_unlock
+  return "${rc}"
+}
+
+# Waits for any in-flight background side effect (via the lock) before
+# invalidating the generation, so killing the job afterwards cannot leave an
+# orphaned surge-cli/docker child that later overwrites a newer route.
 bridge_settle_cancel() {
-  local dir pid
+  local dir pid locked=0
   dir="$(bridge_state_dir)"
   [[ -d "${dir}" ]] || return 0
+  bridge_settle_lock && locked=1
   printf 'cancelled\n' >"${dir}/settle.generation" 2>/dev/null || true
+  [[ "${locked}" -eq 0 ]] || bridge_settle_unlock
   if bridge_settle_job_alive; then
     pid="$(cat "${dir}/settle.pid")"
     kill "${pid}" 2>/dev/null || true
@@ -181,18 +231,20 @@ bridge_settle_status() {
 }
 
 bridge_surge_settle() {
-  local token="${1:-}"
+  local token="${1:-}" rc=0
   bridge_require_callbacks bridge_backend_ready bridge_backend_cleanup || return 1
   if ! bridge_wait_for_stable_route; then
-    bridge_settle_superseded "${token}" && return 0
-    bridge_surge_restore_direct || true
+    bridge_settle_exclusive "${token}" bridge_surge_restore_direct || rc=$?
+    [[ "${rc}" -ne 3 ]] || return 0
     return 1
   fi
-  bridge_settle_superseded "${token}" && return 0
-  bridge_backend_cleanup || return 1
+  bridge_settle_exclusive "${token}" bridge_backend_cleanup || rc=$?
+  [[ "${rc}" -ne 3 ]] || return 0
+  [[ "${rc}" -eq 0 ]] || return 1
   if ! bridge_site_http_probe; then
-    bridge_settle_superseded "${token}" && return 0
-    if bridge_surge_restore_direct; then
+    bridge_settle_exclusive "${token}" bridge_surge_restore_direct || rc=$?
+    [[ "${rc}" -ne 3 ]] || return 0
+    if [[ "${rc}" -eq 0 ]]; then
       printf 'The %s route failed after %s; reverted %s to %s.\n' \
         "${SITE_BACKEND_LABEL}" "${BRIDGE_CLEANUP_LABEL:-backend cleanup}" \
         "${SITE_SURGE_GROUP}" \

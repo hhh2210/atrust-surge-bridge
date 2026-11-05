@@ -638,6 +638,43 @@ test_ui_renders_settle_row() (
   [[ "${output}" != *'syntax error'* ]] || fail "status UI failed to parse: ${output}"
 )
 
+test_cancel_waits_for_inflight_rollback() (
+  local trace bg
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  printf 'gen-1\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  slow_rollback() {
+    command sleep 0.6
+    printf 'direct\n' >>"${trace}"
+  }
+  bridge_settle_exclusive 'gen-1' slow_rollback &
+  bg=$!
+  command sleep 0.2
+  # A new activation cancels while the old rollback is already in flight.
+  bridge_settle_cancel
+  printf 'activate\n' >>"${trace}"
+  wait "${bg}" || true
+  assert_eq $'direct\nactivate' "$(cat "${trace}")" 'cancel waits for in-flight rollback'
+  [[ ! -d "${HITSZ_STATE_DIR}/settle.lock" ]] || fail 'settle lock must be released'
+)
+
+test_superseded_exclusive_skips_side_effect() (
+  local rc=0
+  printf 'cancelled\n' >"${HITSZ_STATE_DIR}/settle.generation"
+  side_effect() { fail 'superseded token must not run its side effect'; }
+  bridge_settle_exclusive 'gen-1' side_effect || rc=$?
+  assert_eq '3' "${rc}" 'superseded exclusive status'
+)
+
+test_stale_settle_lock_is_reclaimed() (
+  mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
+  printf '999999\n' >"${HITSZ_STATE_DIR}/settle.lock/pid"
+  export BRIDGE_SETTLE_LOCK_WAIT_TICKS=5
+  bridge_settle_lock || fail 'a lock owned by a dead PID must be reclaimed'
+  bridge_settle_unlock
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -674,6 +711,9 @@ tests=(
   test_activation_cancels_previous_settle
   test_status_reports_failed_settle
   test_ui_renders_settle_row
+  test_cancel_waits_for_inflight_rollback
+  test_superseded_exclusive_skips_side_effect
+  test_stale_settle_lock_is_reclaimed
 )
 
 for test_name in "${tests[@]}"; do
