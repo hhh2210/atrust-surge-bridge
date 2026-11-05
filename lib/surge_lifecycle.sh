@@ -222,6 +222,17 @@ bridge_settle_unlock() {
   rm -rf "$(bridge_state_dir)/settle.lock"
 }
 
+# uuidgen ships with macOS but not with every Linux base image.
+bridge_settle_new_token() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    printf '%s-%s-%s%s\n' "$(date +%s)" "$$" "${RANDOM}" "${RANDOM}"
+  fi
+}
+
 # Run "$@" only while TOKEN is current, holding the settle lock across both
 # the generation check and the side effect so a cancel cannot slip between
 # them. Returns 3 without running anything when the token is superseded.
@@ -258,7 +269,13 @@ bridge_settle_claim() {
     printf 'A previous stability check is still changing Surge; retry shortly.\n' >&2
     return 1
   fi
-  token="$(uuidgen)"
+  token="$(bridge_settle_new_token)"
+  if [[ -z "${token}" ]]; then
+    # An empty token would make bridge_settle_exclusive skip the lock.
+    bridge_settle_unlock
+    printf 'Could not generate a settle generation token.\n' >&2
+    return 1
+  fi
   printf '%s\n' "${token}" >"${dir}/settle.generation"
   if bridge_settle_job_alive; then
     pid="$(cat "${dir}/settle.pid")"

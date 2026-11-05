@@ -805,6 +805,19 @@ test_concurrent_stale_lock_reclaim_is_exclusive() (
   assert_eq '8' "$(wc -l <"${trace}" | tr -d ' ')" 'every waiter got the lock'
 )
 
+test_claim_without_uuidgen_still_locks() (
+  local bin tool
+  bin="$(mktemp -d -t hitsz-test-bin.XXXXXX)"
+  trap 'rm -rf "${bin}"' EXIT
+  for tool in cat date grep mkdir ps rm seq sleep; do
+    ln -s "$(command -v "${tool}")" "${bin}/${tool}"
+  done
+  PATH="${bin}" bridge_settle_claim
+  [[ -n "${BRIDGE_SETTLE_TOKEN}" ]] || fail 'claim must produce a token without uuidgen'
+  assert_eq "${BRIDGE_SETTLE_TOKEN}" "$(cat "${HITSZ_STATE_DIR}/settle.generation")" \
+    'generation without uuidgen'
+)
+
 test_reclaim_skips_lock_replaced_by_live_owner() (
   mkdir -p "${HITSZ_STATE_DIR}/settle.lock"
   printf '%s\n' "$$" >"${HITSZ_STATE_DIR}/settle.lock/pid"
@@ -859,6 +872,7 @@ tests=(
   test_mode_up_claims_before_login_side_effects
   test_overtaken_activation_never_selects_backend
   test_concurrent_stale_lock_reclaim_is_exclusive
+  test_claim_without_uuidgen_still_locks
   test_reclaim_skips_lock_replaced_by_live_owner
 )
 
