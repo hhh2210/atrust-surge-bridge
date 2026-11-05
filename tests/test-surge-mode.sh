@@ -548,6 +548,7 @@ test_background_settle_dispatch_records_generation() (
   nohup() { printf '%s\n' "$*" >"${trace}"; }
   bridge_surge_settle() { fail 'background dispatch must not settle in the foreground'; }
 
+  bridge_settle_claim
   hitsz_settle_dispatch >/dev/null
   wait
   launched="$(cat "${trace}")"
@@ -651,8 +652,8 @@ test_cancel_waits_for_inflight_rollback() (
   bridge_settle_exclusive 'gen-1' slow_rollback &
   bg=$!
   command sleep 0.2
-  # A new activation cancels while the old rollback is already in flight.
-  bridge_settle_cancel
+  # A new activation claims the route while the old rollback is in flight.
+  bridge_settle_claim
   printf 'activate\n' >>"${trace}"
   wait "${bg}" || true
   assert_eq $'direct\nactivate' "$(cat "${trace}")" 'cancel waits for in-flight rollback'
@@ -696,6 +697,29 @@ test_cancel_timeout_blocks_new_activation() (
   rm -rf "${HITSZ_STATE_DIR}/settle.lock"
 )
 
+test_late_dispatch_from_older_activation_backs_off() (
+  local trace token_a
+  trace="$(mktemp -t hitsz-test-trace.XXXXXX)"
+  trap 'rm -f "${trace}"' EXIT
+
+  nohup() {
+    local last
+    for last in "$@"; do :; done
+    printf 'launch:%s\n' "${last}" >>"${trace}"
+  }
+  # Two overlapping `hitsz up` runs: A claims, then B claims and dispatches,
+  # then A's dispatch arrives late.
+  bridge_settle_claim
+  token_a="${BRIDGE_SETTLE_TOKEN}"
+  bridge_settle_claim
+  hitsz_settle_dispatch >/dev/null
+  wait
+  BRIDGE_SETTLE_TOKEN="${token_a}" hitsz_settle_dispatch >/dev/null
+  wait
+  assert_eq "launch:$(cat "${HITSZ_STATE_DIR}/settle.generation")" "$(cat "${trace}")" \
+    'only the newest activation launches a settle'
+)
+
 tests=(
   test_selection_from_environment
   test_disconnected_atrust_skips_probe
@@ -736,6 +760,7 @@ tests=(
   test_superseded_exclusive_skips_side_effect
   test_stale_settle_lock_is_reclaimed
   test_cancel_timeout_blocks_new_activation
+  test_late_dispatch_from_older_activation_backs_off
 )
 
 for test_name in "${tests[@]}"; do

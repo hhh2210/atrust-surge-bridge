@@ -17,6 +17,11 @@ hitsz_ui_activate_and_settle() {
   local activate_step="${1:-2/3}" settle_step="${2:-3/3}"
   [[ "${stable_seconds}" =~ ^[0-9]+$ ]] || stable_seconds=30
 
+  # Claim here so the token survives the gum child that runs activation.
+  if ! bridge_settle_claim; then
+    hitsz_mode_status
+    return 1
+  fi
   if ! hitsz_ui_run_action "${activate_step} VPN 已连；接入 Surge 并验证 JW…" \
       "${SCRIPT_PATH}" __core_activate; then
     hitsz_ui_warn_activation_failed "$(hitsz_current_selection)"

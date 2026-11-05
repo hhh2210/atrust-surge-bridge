@@ -206,25 +206,31 @@ bridge_settle_exclusive() {
   return "${rc}"
 }
 
-# Waits for any in-flight background side effect (via the lock) before
-# invalidating the generation, so killing the job afterwards cannot leave an
-# orphaned surge-cli/docker child that later overwrites a newer route. Fails
-# closed: without the lock the old job keeps ownership and nothing is killed.
-bridge_settle_cancel() {
-  local dir pid
+# Claims route ownership for a new activation: under the settle lock (which
+# waits for any in-flight background side effect) it publishes a fresh
+# generation in BRIDGE_SETTLE_TOKEN, then stops the old job. Killing the old
+# job afterwards cannot leave an orphaned surge-cli/docker child that later
+# overwrites the newer route, and a late dispatch from an older activation
+# sees a different generation and backs off. Fails closed: without the lock
+# the old job keeps ownership and nothing is killed. Call it directly, not in
+# a command substitution, so the exported token reaches the caller.
+bridge_settle_claim() {
+  local dir pid token
   dir="$(bridge_state_dir)"
-  [[ -d "${dir}" ]] || return 0
+  (umask 077 && mkdir -p "${dir}") || return 1
   if ! bridge_settle_lock; then
     printf 'A previous stability check is still changing Surge; retry shortly.\n' >&2
     return 1
   fi
-  printf 'cancelled\n' >"${dir}/settle.generation" 2>/dev/null || true
-  bridge_settle_unlock
+  token="$(uuidgen)"
+  printf '%s\n' "${token}" >"${dir}/settle.generation"
   if bridge_settle_job_alive; then
     pid="$(cat "${dir}/settle.pid")"
     kill "${pid}" 2>/dev/null || true
   fi
   rm -f "${dir}/settle.pid"
+  bridge_settle_unlock
+  export BRIDGE_SETTLE_TOKEN="${token}"
 }
 
 # Prints RUNNING or FAILED when a background settle needs attention.
@@ -283,20 +289,29 @@ bridge_settle_run_bg() {
 
 # The route is already usable after activation; keep the stability window and
 # its DIRECT rollback, but stop blocking the command on it. $1 is the CLI that
-# implements the `__core_settle_bg <token>` entry point.
+# implements the `__core_settle_bg <token>` entry point. The job is published
+# only if BRIDGE_SETTLE_TOKEN (claimed by this activation) is still current.
 bridge_settle_dispatch() {
-  local cli="$1" dir token log
+  local cli="$1" token="${BRIDGE_SETTLE_TOKEN:-}" dir log
   if [[ "${BRIDGE_SETTLE_FOREGROUND:-${HITSZ_SETTLE_FOREGROUND:-0}}" == "1" ]]; then
-    bridge_surge_settle
+    bridge_surge_settle "${token}"
     return
   fi
+  if [[ -z "${token}" ]]; then
+    printf 'No claimed settle generation; activation must claim the route first.\n' >&2
+    return 1
+  fi
   dir="$(bridge_state_dir)"
-  (umask 077 && mkdir -p "${dir}") || return 1
-  token="$(uuidgen)"
   log="${dir}/settle.log"
-  printf '%s\n' "${token}" >"${dir}/settle.generation"
+  bridge_settle_lock || return 1
+  if bridge_settle_superseded "${token}"; then
+    bridge_settle_unlock
+    printf 'A newer activation owns the route; skipping this stability check.\n'
+    return 0
+  fi
   printf 'running %s\n' "$(date +%s)" >"${dir}/settle.state"
   nohup "${cli}" __core_settle_bg "${token}" >"${log}" 2>&1 </dev/null &
   printf '%s\n' "$!" >"${dir}/settle.pid"
+  bridge_settle_unlock
   printf 'Stability check continues in the background (log: %s).\n' "${log}"
 }
