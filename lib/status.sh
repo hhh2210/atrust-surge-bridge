@@ -13,6 +13,7 @@ hitsz_status_jw_code() {
 }
 
 hitsz_collect_status() {
+  HITSZ_STATUS_PRINTER="$(hitsz_printer_status)"
   HITSZ_STATUS_DOCKER="OFF"
   HITSZ_STATUS_USAGE=""
   HITSZ_STATUS_VPN="DISCONNECTED"

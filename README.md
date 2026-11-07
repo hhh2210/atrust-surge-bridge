@@ -327,3 +327,31 @@ See [SECURITY.md](SECURITY.md) before reporting a security issue.
 
 MIT. The license covers this repository's original scripts and documentation,
 not Sangfor/aTrust, Surge, or third-party container contents.
+
+### HITSZ printer forward (macOS)
+
+An existing `M280nw_aTrust` CUPS queue pointing to
+`ipp://127.0.0.1:8631/ipp/print` enables the optional printer integration.
+Install `socat` (with SOCKS5 support) and Python 3 before using it.
+`hitsz up` registers a user LaunchAgent that forwards loopback port 8631
+through the existing SOCKS endpoint to `10.249.42.42:631`. launchd keeps the
+forward alive across terminal exits and restarts it after a crash. At the next
+macOS login it starts again; reaching the printer still requires the HITSZ VPN.
+`hitsz down` unloads the agent and removes its login registration before
+stopping the VM. Neither command creates a printer queue or submits print jobs.
+
+`hitsz status` includes the printer path's health (a response from the printer,
+not just an open local port). For repairing only this path without restarting
+the VPN:
+
+```sh
+hitsz printer up
+hitsz printer status
+hitsz printer down
+```
+
+An unmanaged listener on 8631 is reported, never killed or adopted. Logs are
+under `~/Library/Logs/hitsz/printer.log`. A failed printer start warns without
+interrupting VPN stability checks. `HITSZ_PRINTER_DISABLED=1` disables automatic
+printer startup. The integration is skipped on other site profiles and machines
+without the matching queue.

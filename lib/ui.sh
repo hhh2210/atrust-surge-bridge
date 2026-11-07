@@ -20,6 +20,7 @@ hitsz_ui_plain_status() {
   fi
   printf 'Docker: %s%s\n' "${HITSZ_STATUS_DOCKER}" "${HITSZ_STATUS_USAGE:+ (${HITSZ_STATUS_USAGE})}"
   printf 'VPN: %s\n' "${HITSZ_STATUS_VPN}"
+  printf 'Printer: %s\n' "${HITSZ_STATUS_PRINTER:-NOT CONFIGURED}"
   printf 'SOCKS: %s:%s %s\n' \
     "${SITE_SOCKS_HOST}" "${SITE_SOCKS_PORT}" "${HITSZ_STATUS_SOCKS}"
   [[ -z "${HITSZ_STATUS_SETTLE:-}" ]] ||
@@ -76,6 +77,7 @@ hitsz_ui_render_status() {
     printf '  %-9s %s\n' 'Docker' "${docker_value}"
     printf '  %-9s %s\n' 'VPN' "${vpn_value}"
     printf '  %-9s %s\n' 'SOCKS' "${socks_value}"
+    printf '  %-9s %s\n' 'Printer' "${HITSZ_STATUS_PRINTER:-NOT CONFIGURED}"
     [[ -z "${settle_value}" ]] || printf '  %-9s %s\n' 'Settle' "${settle_value}"
   )"
 

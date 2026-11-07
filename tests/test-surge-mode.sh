@@ -1,6 +1,7 @@
 #!/bin/bash
 # shellcheck disable=SC2317,SC2329,SC2030,SC2031 # Mocks are called indirectly; each test is an isolated subshell.
 set -euo pipefail
+export HITSZ_PRINTER_DISABLED=1 # Never touch the host printer during route tests.
 
 TEST_ROOT="$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)"
 

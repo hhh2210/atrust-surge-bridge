@@ -20,6 +20,9 @@ die() {
 source "${ROOT_DIR}/lib/site_profile.sh"
 load_site_profile "${ATRUST_SITE:-hitsz}"
 
+# shellcheck source=printer.sh
+source "${ROOT_DIR}/lib/printer.sh"
+
 require_command() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }

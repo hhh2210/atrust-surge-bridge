@@ -4,6 +4,7 @@ set -euo pipefail
 source "$(unset CDPATH; cd -- "$(dirname -- "$0")/.." && pwd)/lib/common.sh"
 
 ensure_tools
+hitsz_printer_stop
 
 if colima_running; then
   ensure_env

@@ -178,7 +178,10 @@ hitsz_mode_activate_route() {
   if [[ -z "${BRIDGE_SETTLE_TOKEN:-}" ]]; then
     bridge_settle_claim || return 1
   fi
-  bridge_surge_activate "${BRIDGE_SETTLE_TOKEN}"
+  bridge_surge_activate "${BRIDGE_SETTLE_TOKEN}" || return 1
+  if ! bridge_settle_exclusive "${BRIDGE_SETTLE_TOKEN}" hitsz_printer_start; then
+    printf 'WARNING: printer forward failed; VPN remains available. Run hitsz printer status.\n' >&2
+  fi
 }
 # Foreground settles (plain mode, __core_settle, HITSZ_SETTLE_FOREGROUND=1)
 # carry the claimed token too, so a newer activation still supersedes them.

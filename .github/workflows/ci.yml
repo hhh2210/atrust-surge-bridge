@@ -36,6 +36,7 @@ jobs:
 
       - name: Test lifecycle state machine
         run: |
+          bash ./tests/test-printer.sh
           bash ./tests/test-site-profile.sh
           bash ./tests/test-surge-lifecycle.sh
           bash ./tests/test-surge-mode.sh

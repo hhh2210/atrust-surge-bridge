@@ -119,11 +119,19 @@ case "${action}" in
       hitsz_mode_status
     fi
     ;;
+  printer)
+    case "${2:-status}" in
+      up) hitsz_printer_start; hitsz_printer_status ;;
+      down) hitsz_printer_stop; hitsz_printer_status ;;
+      status) hitsz_printer_status ;;
+      *) printf "usage: hitsz printer {up|down|status}\n" >&2; exit 64 ;;
+    esac
+    ;;
   status)
     hitsz_mode_status
     ;;
   *)
-    printf 'usage: hitsz {up|login|down|status}\n' >&2
+    printf 'usage: hitsz {up|login|down|status|printer}\n' >&2
     printf '  up:   start isolated aTrust for use outside campus\n' >&2
     printf '  login: show the loopback noVNC credential and open the login UI\n' >&2
     printf '  down: stop Docker/Colima; Surge keeps campus DIRECT access\n' >&2
